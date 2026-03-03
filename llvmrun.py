@@ -4,7 +4,6 @@ from llvm.fileTop10 import get_full_sbfl_with_summary, analyze_and_rank_files
 from llvm.generateMutate import generateMutate
 from llvm.log import generate_logs
 from llvm.rank import fileRank
-from llvm.rootCause import root_cause
 
 config = ConfigParser()
 config.read('./config/config.ini', encoding='utf-8')
@@ -48,7 +47,7 @@ def process_bugid_wrapper(args):
     return bugid
 
 
-with ProcessPoolExecutor(max_workers=1) as executor:
+with ProcessPoolExecutor(max_workers=9) as executor:
     # 提交所有任务
     future_to_bugid = {
         executor.submit(process_bugid_wrapper, (
