@@ -16,7 +16,7 @@ def fileRank(bugId, rev, configFile):
     infodir = cfg.get('llvm-locations', 'infodir')
     passdir = cfg.get('llvm-locations', 'passdir')
     baseResultFile = cfg.get('llvm-locations', 'resultDir')
-    resultFile = baseResultFile + bugId + '/resultFile_file.csv'
+    resultFile = baseResultFile + bugId + '/SBFL.csv'
     if not os.path.exists(baseResultFile + bugId):
         os.mkdir(baseResultFile + bugId)
     result = open(resultFile, 'w')
