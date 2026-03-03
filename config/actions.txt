@@ -1,0 +1,32 @@
+insertSequentialStmt;inserting a sequential statement
+deleteSequentialStmt;deleting a sequential statement
+moveStmt;moving a statement (to alter the sequence of statement)
+insertBranch;inserting a branch statement (e.g., if)
+deleteBranch;deleting a branch statement
+modifyBranchCond;changing a branch condition
+insertNestedBranch;inserting a nested branch statement
+insertLoop;inserting a loop statement (e.g., for/while)
+deleteLoop;deleting a loop statement
+modifyLoopCond;changing a loop condition
+insertNestedLoop;inserting a loop with nested loop
+insertLoopPragma;inserting a loop #pragma command
+insertGoto;inserting a goto statement
+insertFuncCall;inserting a function call
+insertFunction;inserting a function definition
+extractStmtToFunc;extracting a statement into a function
+addFuncParam;adding a function parameter
+addFuncModifier;adding a function modifier (e.g., inline)
+insertFuncPragma;inserting a function #pragma command
+replaceVariable;replacing a variable with another available variable within the feasible scope
+insertVarDecl;inserting a new variable declaration
+modifyConstant;changing a constant value (e.g., +1, -1, *(-1), 0)
+extractConstant;extracting a constant into a variable
+addTypeModifier;adding a modifier (i.e., long, short, signed, and unsigned) of a variable
+removeTypeModifier;removing a modifier (i.e., long, short, signed, and unsigned) of a variable
+addQualifier;inserting a qualifier (i.e., volatile, const, and restrict) of a variable
+removeQualifier;removing a qualifier (i.e., volatile, const, and restrict) of a variable
+replaceBinaryOp;replacing a binary operator with another valid one
+replaceUnaryOp;replacing a unary operator with another valid one
+removeUnaryOp;removing a unary operator on the variables
+parenthesizeExpr;parenthesizing an expression
+replaceExprOp;replacing an expression operator with another (e.g., +, -)
