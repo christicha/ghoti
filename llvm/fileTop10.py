@@ -124,39 +124,19 @@ def extract_ranks_from_md(md_text):
     return llm_ranks, sbfl_ranks
 
 
-def monte_carlo_rank_aggregation(llm_ranks, sbfl_ranks, sbfl_file_path, num_simulations=10000):
+def monte_carlo_rank_aggregation(llm_ranks, sbfl_ranks, num_simulations=10000):
     """
     使用蒙特卡洛模拟算法聚合排名。
-    核心思想：以 SBFL 文件中出现的文件名为基准。
-    模拟 10000 次，每次随机生成 LLM 和 SBFL 的权重比例，
+    核心思想：模拟 10000 次，每次随机生成 LLM 和 SBFL 的权重比例，
     计算加权倒数排名融合（RRF）得分，最终得出期望得分并重新排序。
     """
+    all_files = set(llm_ranks.keys()).union(set(sbfl_ranks.keys()))
 
-    # 从 SBFL csv 文件中读取基准文件名和原始排名
-    base_sbfl_ranks = {}
-    if os.path.exists(sbfl_file_path):
-        with open(sbfl_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            for line in lines:
-                line = line.strip()
-                if not line or line.lower().startswith("rank"):
-                    continue
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    rank = int(parts[0].strip())
-                    filepath = parts[1].strip()
-                    base_sbfl_ranks[filepath] = rank
-
-    if not base_sbfl_ranks:
-        print("⚠️ 警告：无法读取 SBFL 基准排名，降级使用参数传递的文件集合。")
-        all_files = set(llm_ranks.keys()).union(set(sbfl_ranks.keys()))
-        base_sbfl_ranks = sbfl_ranks
-    else:
-        all_files = set(base_sbfl_ranks.keys())
-
-    # 针对 LLM 可能未输出排名的文件进行惩罚（赋予末尾排名）
+    # 针对缺失排名的文件进行惩罚（赋予末尾排名）
     max_llm = max(llm_ranks.values()) if llm_ranks else 100
+    max_sbfl = max(sbfl_ranks.values()) if sbfl_ranks else 100
     default_llm = max_llm + 10
+    default_sbfl = max_sbfl + 10
 
     # RRF (Reciprocal Rank Fusion) 常数 k，用于平滑极端排名差
     k = 60
@@ -170,7 +150,7 @@ def monte_carlo_rank_aggregation(llm_ranks, sbfl_ranks, sbfl_file_path, num_simu
 
         for f in all_files:
             r_llm = llm_ranks.get(f, default_llm)
-            r_sbfl = base_sbfl_ranks.get(f)  # 必定存在，因为 all_files 是基于它生成的
+            r_sbfl = sbfl_ranks.get(f, default_sbfl)
 
             # 计算单词模拟的加权得分
             score = w_llm * (1.0 / (k + r_llm)) + w_sbfl * (1.0 / (k + r_sbfl))
@@ -185,7 +165,7 @@ def monte_carlo_rank_aggregation(llm_ranks, sbfl_ranks, sbfl_file_path, num_simu
             "FinalRank": i + 1,
             "Filename": f,
             "LLMRank": llm_ranks.get(f, "-"),
-            "SBFLRank": base_sbfl_ranks.get(f, "-"),
+            "SBFLRank": sbfl_ranks.get(f, "-"),
             "AggScore": round(score / num_simulations, 6)
         })
 
@@ -316,7 +296,7 @@ def analyze_and_rank_files(bugid, configFile, rightOption, wrongOption):
     ### 1. 缺陷领域画像
     简要总结该 Bug 所属的核心编译器模块和优化阶段。
     ### 2. 完整的可疑文件重排序列表
-    请提供一个表格，必须包含以下列，文件列表尽可能完整：
+    请提供一个表格，必须包含以下列：
     | Rank | Filename | 原SBFL排名 | 重排序理由摘要 |
     """
 
@@ -364,6 +344,7 @@ def analyze_and_rank_files(bugid, configFile, rightOption, wrongOption):
                 writer.writerow(row)
 
         print(f"✅ 成功！最终聚合排名已保存至: {csv_path}")
+        print("\n🎉 全链路分析与多维度排名合并完成！")
 
     except Exception as e:
         print(f"❌ 聚合分析执行失败: {str(e)}")
