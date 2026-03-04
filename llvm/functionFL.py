@@ -4,6 +4,7 @@ import re
 import subprocess
 from configparser import ConfigParser
 from openai import OpenAI
+from llvm.fileTop10 import read_file_content
 
 
 def function_list(bugid,  configPath):
@@ -69,7 +70,7 @@ def function_list(bugid,  configPath):
         * 根据函数的内部逻辑，用 1-3 句话精准总结该函数的实际功能（重点说明它输入了什么、修改了什么状态、输出了什么）。
     
         # 输出格式要求
-        为了便于自动化脚本解析，对于你提取出的每一个函数，请单独使用一个 Markdown JSON 代码框进行输出。
+        为了便于自动化脚本解析，对于你提取出的每一个函数，请单独使用一个 Markdown JSON 代码框进行输出(即```json)。
         绝对不要将所有函数合并成一个大的 JSON 数组，也不要输出任何额外的解释性废话或过渡性文字。请严格按照以下格式逐个输出：
         {{
           "signature": "完整的函数签名，如 bool llvm::InstCombiner::visitAdd(BinaryOperator &I)",
@@ -249,5 +250,153 @@ def is_function_exe(bugid, configPath):
         print(f"   - 过滤了 {len(json_blocks) - len(retained_blocks)} 个死代码函数")
 
     print(f"\n🎉 覆盖率清洗完成！共保留 {retained_count} 个执行函数，剔除 {filtered_count} 个未执行函数。")
+
+
+def extract_log_diff(log_path):
+    """辅助函数：从完整的 compile.log 中提取出底部的差异对比分析部分"""
+    if not os.path.exists(log_path):
+        return "⚠️ 编译日志不存在。"
+
+    with open(log_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 尝试匹配我们之前在日志中定义的差异对比分割线
+    # 兼容两种可能的写法："【🚨 核心差异对比分析】" 或 "【跨配置核心差异对比】"
+    match = re.search(r'【(?:🚨 核心|跨配置核心)差异对比.*?】(.*)', content, re.DOTALL)
+    if match:
+        return match.group(0).strip()
+
+    # 如果没找到特定的标题，提取最后 2000 个字符作为 fallback
+    return "⚠️ 未找到标准的差异对比分割线，截取日志尾部特征：\n" + content[-2000:]
+
+
+def function_FL(bugid, configPath):
+    cfg = ConfigParser()
+    cfg.read(configPath)
+
+    # 1. 获取路径配置
+    baseLogDir = cfg.get('llvm-locations', 'logDir')
+    baseResultDir = cfg.get('llvm-locations', 'resultDir')
+    baseFileListDir = cfg.get('llvm-locations', 'fileListDir')
+
+    logDir = os.path.join(baseLogDir, bugid)
+    resultDir = os.path.join(baseResultDir, bugid)
+    fileListDir = os.path.join(baseFileListDir, bugid)
+
+    # 获取 LLM API 配置
+    api_key = cfg.get('deepseek', 'api')
+    api_url = cfg.get('deepseek', 'url')
+
+    print(f"\n==============================================")
+    print(f"🎯 开始为 BugID: {bugid} 执行最终函数级缺陷定位")
+    print(f"==============================================\n")
+
+    # 2. 收集线索数据
+    # 线索 1：根因分析报告
+    rca_path = os.path.join(logDir, 'root_cause.md')
+    rca_content = read_file_content(rca_path)
+    if not rca_content:
+        print("❌ 致命错误：找不到根因分析报告 (root_cause.md)。")
+        return
+
+    # 线索 2：编译日志核心差异
+    compile_log_path = os.path.join(logDir, 'compile.log')
+    log_diff_content = extract_log_diff(compile_log_path)
+
+    # 线索 3：高危文件级排名 (提取 CSV 的前 10 行文本表现形式)
+    rank_csv_path = os.path.join(resultDir, 'final_file_rank.csv')
+    file_rank_str = ""
+    if os.path.exists(rank_csv_path):
+        try:
+            with open(rank_csv_path, 'r', encoding='utf-8') as f:
+                # 简单读取前 11 行（包含表头）作为文本
+                lines = f.readlines()
+                file_rank_str = "".join(lines[:11])
+        except Exception as e:
+            file_rank_str = f"⚠️ 读取文件排名失败: {str(e)}"
+    else:
+        file_rank_str = "⚠️ final_file_rank.csv 不存在。"
+
+    # 线索 4：动态覆盖率验证后的候选函数库 (*_filtered.md)
+    candidate_functions = []
+    if os.path.exists(fileListDir):
+        for filename in os.listdir(fileListDir):
+            if filename.endswith('_filtered.md'):
+                # 提取原文件名，比如 LoopVectorize.cpp_functions_filtered.md -> LoopVectorize.cpp
+                orig_filename = filename.replace('_functions_filtered.md', '')
+                content = read_file_content(os.path.join(fileListDir, filename))
+                if content.strip() and "未被覆盖率命中" not in content:
+                    candidate_functions.append(f"### 文件: {orig_filename}\n{content}\n")
+
+    candidate_functions_str = "\n".join(candidate_functions)
+    if not candidate_functions_str.strip():
+        print("❌ 致命错误：候选函数库为空！(可能所有函数都被覆盖率清洗掉了)")
+        return
+
+    # 3. 组装 Prompt
+    system_prompt = (
+        "你是一位世界顶级的 LLVM 编译器底层研发专家与高级静态分析师。"
+        "你精通编译器优化管线（Pass Pipeline）、指令选择（Instruction Selection）、"
+        "IR 转换逻辑以及 x86-64 汇编差异分析。"
+    )
+
+    user_prompt = f"""# 任务目标
+    我们正在进行编译器缺陷定位的最终阶段：函数级定位。
+    我已经通过多维度的交叉验证，为你锁定了极小范围的嫌疑函数集合（这些函数均已被证实会在触发 Bug 的测试用例中执行）。
+    请你综合我提供的“根因分析报告”、“编译日志核心差异”以及“高危文件排名”，对提供的“候选函数库”进行深度审查，最终排查并给出一份包含所有函数的可疑度最终排名。
+    
+    输入数据
+    1. 缺陷根因分析报告
+    【说明：这是我们前期推导出的编译器逻辑断层与嫌疑 Pass 画像。】
+    {rca_content}
+    2. 编译日志核心差异
+    【说明：这是触发 Bug 的优化级别与正常优化级别在底层汇编和 Pass 执行上的直接物理证据。】
+    {log_diff_content}
+    3. 高危文件级排名
+    【说明：候选函数所在文件的宏观可疑度背景，排名越靠前，其内部函数藏匿 Bug 的概率越高。】
+    {file_rank_str}
+    4. 动态覆盖率验证后的候选函数库
+    【说明：这是从高危文件中提取出的、且被真实执行过的核心业务函数及其功能摘要。】
+    {candidate_functions_str}
+    
+    分析指令（请严格按以下思维链执行）
+    第一步：锁定罪证特征
+    分析【编译日志核心差异】，明确到底是哪条具体的机器指令被错误生成或错误删除了。结合【RCA 报告】，用一句话明确我们要在候选函数中寻找什么样的“作案动机”。
+    注：不仅要关注直接生成/折叠该指令的表面逻辑，还要思考支撑该逻辑的底层分析依赖。
+    第二步：函数职责“审问”与调用链穿透
+    逐一阅读【候选函数库】中的函数签名与功能摘要：
+    1. 直接职责匹配：该函数的作用范围是否恰好覆盖了第一步锁定的“罪证特征”？
+    2. 职责下放与嵌套审查 (Caller-Callee Consideration) [核心要点]：绝对不要只盯着表面的“入口函数”（Dispatcher）！ 如果函数 A（看似极度可疑的顶层处理函数）的功能实现高度依赖内部调用的辅助函数 B，你必须同时评估 A 和 B。仔细甄别谁才是真正的“幕后黑手”。
+    3. 上下文权重：结合该函数所在的【高危文件排名】，如果它处于 Top 1 或 Top 2 的文件中，其嫌疑度应被基础放大。
+    
+    输出格式要求
+    请提供一个 Markdown 表格，按照可疑指数排名，要求表格包含所有文件中所有给定的候选函数，功能类似的函数可以并列排名
+    | Rank | 所属文件 | 函数签名 (Signature) | 可疑指数 (1-10) |
+    """
+
+    print("🧠 数据装载完毕，正在呼叫大模型执行函数排名 (请耐心等待)...")
+    try:
+        client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
+        response = client.chat.completions.create(
+            model="deepseek-reasoner",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=50000
+        )
+        final_report = response.choices[0].message.content
+
+        # 4. 保存最终报告
+        out_file_path = os.path.join(resultDir, 'function_level_localization.md')
+        with open(out_file_path, 'w', encoding='utf-8') as out_f:
+            out_f.write(final_report)
+
+        print(f"✅ 成功！函数级缺陷定位报告已保存至: {out_file_path}")
+
+    except Exception as e:
+        print(f"❌ API 调用失败: {str(e)}")
+
 
 

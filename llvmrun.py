@@ -1,7 +1,7 @@
 from configparser import ConfigParser
 
 from llvm.fileTop10 import get_full_sbfl_with_summary, analyze_and_rank_files, get_top_10_files
-from llvm.functionFL import function_list, is_function_exe
+from llvm.functionFL import function_list, is_function_exe, function_FL
 from llvm.generateMutate import generateMutate
 from llvm.log import generate_logs
 from llvm.rank import fileRank
@@ -42,11 +42,12 @@ def process_bugid_wrapper(args):
     check = checks[i]
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
     generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
-    # fileRank(bugid, revision, configPath)
+    fileRank(bugid, revision, configPath)
     analyze_and_rank_files(bugid, configPath, compileOptionRight, compileOptionWrong)
-    # get_top_10_files(bugid, revision, configPath)
-    # function_list(bugid, configPath)
-    # is_function_exe(bugid, configPath)
+    get_top_10_files(bugid, revision, configPath)
+    function_list(bugid, configPath)
+    is_function_exe(bugid, configPath)
+    function_FL(bugid, configPath)
 
     return bugid
 
@@ -63,7 +64,6 @@ with ProcessPoolExecutor(max_workers=9) as executor:
     # 收集结果
     completed_count = 0
     total_count = len(bugIds)
-
 
     for future in as_completed(future_to_bugid):
         bugid = future_to_bugid[future]

@@ -7,12 +7,23 @@ config.read('./config/config.ini', encoding='utf-8')
 compilerBasePath = config.get('llvm-locations', 'compilersdir')
 buglist = config.get('llvm-locations', 'bugList')
 infoBasePath = config.get('llvm-locations', 'infodir')
+resultBasePath =config.get('llvm-locations', 'resultDit')
+fileListBasePath = config.get('llvm-locations', 'fileListDir')
 benchmarkPath = config.get('llvm-locations', 'benchmark')
+
+if not os.path.exists(infoBasePath):
+    os.mkdir(infoBasePath)
+if not os.path.exists(resultBasePath):
+    os.mkdir(resultBasePath)
+if not os.path.exists(fileListBasePath):
+    os.mkdir(fileListBasePath)
 
 bugIds = []
 revisions = []
 compileOptionRights = []
 compileOptionWrongs = []
+
+
 
 with open(buglist, 'r') as f:
     for line in f:
