@@ -3,6 +3,7 @@ import json
 import csv
 import re
 import random
+import shutil
 from configparser import ConfigParser
 from openai import OpenAI
 
@@ -280,23 +281,31 @@ def analyze_and_rank_files(bugid, configFile, rightOption, wrongOption):
         return
 
     ranking_prompt = f"""非常好！现在基于你刚刚得出的根因分析逻辑，我们需要将范围锁定到具体的编译器源码文件。
-    我将为你提供一份基于覆盖率计算的“SBFL可疑度排名”以及“被执行文件的功能摘要”。
+    我将为你提供一份触发bug的测试程序源代码，以及基于这个源代码得出的“SBFL可疑度排名”和“被执行文件的功能摘要”。
 
-    # 输入数据：SBFL排名及被执行文件的功能摘要
+    # 输入数据：
+    触发bug的测试程序源代码:
+    {ori_content}
+    SBFL排名及被执行文件的功能摘要
     {sbfl_summary_content}
 
-    # 分析指令
-    请你将统计学证据（SBFL）与你刚刚得出的语义学线索（RCA报告）进行深度交叉验证：
-    1. 降权/剔除假阳性：如果一个文件在 SBFL 中排名很高，但其功能摘要显示它只是底层的通用数据结构或基础流程控制，且与 RCA 的核心特征毫不相干，请果断降低其嫌疑度。
-    2. 提权/锁定真阳性：如果某文件的功能摘要与你刚刚指出的“嫌疑优化 Pass”及“指令破坏特征”高度吻合，请大幅提升其嫌疑度。
-    3. 缺陷机理推断：针对提权后的核心文件，结合你之前描述的逻辑断层，用一两句话推断该文件内部的代码具体是如何犯错的。
+    # 分析指令（请严格按以下思维链执行）
+    第一步：提取 RCA 核心特征
+    特征识别：从 RCA 报告中提取核心领域词，识别导致错误的优化开关条件。记录该错误是否仅在特定优化强度（如激进冗余消除、跨循环边界分析）下触发。
+    第二步：SBFL 排名与优化路径验证
+    遍历 SBFL 高危名单，结合文件功能摘要进行权重重构：
+    路径提权（真阳性锁定）：如果 SBFL 排名靠前的文件属于 RCA 提到的特定优化 Pass（如 DeadStoreElimination.cpp）或支撑该 Pass 的核心依赖分析（如 MemoryDependenceAnalysis.cpp），且该文件在更高优化等级下会启用更激进策略，则将其锁定为头号嫌疑。
+    通用项降权（假阳性剔除）：对于 SBFL 排名虽高但属于通用底层库（如 StringRef.cpp, Instructions.cpp）或不随优化等级改变逻辑的模块，果断降低其嫌疑度。
+    第三步：诱发机理推断
+    针对锁定的核心文件，结合优化等级带来的“激进性”差异，用一句话推断逻辑断层：
+    推断模式：该文件在执行 [具体优化动作] 时，是否因为 [高优化等级下的激进假设]，错误地忽略了 [特定的控制流/数据流约束]（例如：DSE 在跨循环分析时，错误地认为不可达的分支会覆盖当前的有效存储）。
 
     # 输出格式要求
     请以结构化的 Markdown 格式输出最终结果：
     ### 1. 缺陷领域画像
     简要总结该 Bug 所属的核心编译器模块和优化阶段。
     ### 2. 完整的可疑文件重排序列表
-    请提供一个表格，必须包含以下列：
+    请提供一个表格，必须包含以下列，尽可能包括SBFL列表中所有给出的文件：
     | Rank | Filename | 原SBFL排名 | 重排序理由摘要 |
     """
 
@@ -348,3 +357,83 @@ def analyze_and_rank_files(bugid, configFile, rightOption, wrongOption):
 
     except Exception as e:
         print(f"❌ 聚合分析执行失败: {str(e)}")
+
+
+def get_top_10_files(bugid, rev, configFile):
+    cfg = ConfigParser()
+    cfg.read(configFile)
+
+    # 1. 获取路径配置
+    baseResultDir = cfg.get('llvm-locations', 'resultDir')
+    baseCompilerDir = cfg.get('llvm-locations', 'compilersdir')
+    baseFileListDir = cfg.get('llvm-locations', 'fileListDir')
+
+    rank_file = os.path.join(baseResultDir, bugid, 'final_file_rank.csv')
+    compilerDir = os.path.join(baseCompilerDir, rev, rev, 'llvm')  # 适配 LLVM 源码路径结构，可根据实际情况微调
+    fileListDir = os.path.join(baseFileListDir, bugid)
+
+    print(f"\n📦 开始为 BugID: {bugid} 提取 Top 10 嫌疑文件...")
+
+    # 2. 检查前置条件
+    if not os.path.exists(rank_file):
+        print(f"❌ 致命错误：找不到最终排名文件: {rank_file}")
+        return
+
+    if not os.path.exists(compilerDir):
+        print(f"❌ 致命错误：找不到编译器源码目录: {compilerDir}")
+        return
+
+    # 创建目标文件夹
+    os.makedirs(fileListDir, exist_ok=True)
+
+    # 3. 解析 CSV 并提取排名前 10 的文件
+    top_10_filenames = []
+    try:
+        with open(rank_file, 'r', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for i, row in enumerate(reader):
+                if i >= 10:  # 只取前 10
+                    break
+                # 提取 Filename 列
+                if 'Filename' in row:
+                    top_10_filenames.append(row['Filename'].strip())
+    except Exception as e:
+        print(f"❌ 读取 CSV 文件失败: {str(e)}")
+        return
+
+    if not top_10_filenames:
+        print("⚠️ 警告：在 CSV 中未找到任何文件记录。")
+        return
+
+    print(f"📋 已提取 Top 10 文件名单，准备在源码树中搜索并复制...")
+
+    # 4. 在源码树中搜索并复制文件
+    copied_count = 0
+    for filepath in top_10_filenames:
+        # 策略 1：假设 CSV 中的路径是基于 llvm 源码根目录的相对路径 (如 lib/IR/Dominators.cpp)
+        src_path = os.path.abspath(os.path.join(compilerDir, filepath))
+
+        # 策略 2：如果策略 1 找不到，退化为通过纯文件名在全树深度搜索
+        if not os.path.exists(src_path):
+            basename = os.path.basename(filepath)
+            found = False
+            for root, dirs, files in os.walk(compilerDir):
+                if basename in files:
+                    src_path = os.path.join(root, basename)
+                    found = True
+                    break
+
+            if not found:
+                print(f"  ❌ 未找到文件: {filepath} (已尝试全树搜索)")
+                continue
+
+        # 5. 执行复制操作
+        dst_path = os.path.join(fileListDir, os.path.basename(src_path))
+        try:
+            shutil.copy2(src_path, dst_path)
+            copied_count += 1
+            print(f"  ✅ 成功复制: {os.path.basename(src_path)}")
+        except Exception as e:
+            print(f"  ❌ 复制失败 [{src_path}]: {str(e)}")
+
+    print(f"\n🎉 提取完成！共成功复制 {copied_count}/10 个文件到: {fileListDir}")
