@@ -368,11 +368,16 @@ def get_top_10_files(bugid, rev, configFile):
     baseCompilerDir = cfg.get('llvm-locations', 'compilersdir')
     baseFileListDir = cfg.get('llvm-locations', 'fileListDir')
 
-    rank_file = os.path.join(baseResultDir, bugid, 'final_file_rank.csv')
-    compilerDir = os.path.join(baseCompilerDir, rev, rev, 'llvm')  # 适配 LLVM 源码路径结构，可根据实际情况微调
+    rank_file = os.path.join('/home/chris/FLL-workplace/llvmbugs/result', bugid, 'aggregate_result.csv')
+    compilerDir = os.path.join(baseCompilerDir, rev, rev, 'llvm')
     fileListDir = os.path.join(baseFileListDir, bugid)
 
     print(f"\n📦 开始为 BugID: {bugid} 提取 Top 10 嫌疑文件...")
+    if os.path.exists(fileListDir):
+        shutil.rmtree(fileListDir)
+
+    # 创建目标文件夹
+    os.makedirs(fileListDir, exist_ok=True)
 
     # 2. 检查前置条件
     if not os.path.exists(rank_file):
@@ -383,9 +388,6 @@ def get_top_10_files(bugid, rev, configFile):
         print(f"❌ 致命错误：找不到编译器源码目录: {compilerDir}")
         return
 
-    # 创建目标文件夹
-    os.makedirs(fileListDir, exist_ok=True)
-
     # 3. 解析 CSV 并提取排名前 10 的文件
     top_10_filenames = []
     try:
@@ -395,8 +397,8 @@ def get_top_10_files(bugid, rev, configFile):
                 if i >= 10:  # 只取前 10
                     break
                 # 提取 Filename 列
-                if 'Filename' in row:
-                    top_10_filenames.append(row['Filename'].strip())
+                if 'File' in row:
+                    top_10_filenames.append(row['File'].strip())
     except Exception as e:
         print(f"❌ 读取 CSV 文件失败: {str(e)}")
         return

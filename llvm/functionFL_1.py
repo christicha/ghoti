@@ -86,7 +86,7 @@ def function_list(bugid,  configPath):
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.1,
-                max_tokens=50000
+                max_tokens=10000
             )
 
             result_text = response.choices[0].message.content
@@ -187,23 +187,69 @@ def is_function_exe(bugid, configPath):
 
     baseFileListDir = cfg.get('llvm-locations', 'fileListDir')
     baseInfoDir = cfg.get('llvm-locations', 'infodir')
+    baseFailDir = cfg.get('llvm-locations', 'passdir')
+
     fileListDir = os.path.join(baseFileListDir, bugid)
+    # 原有的单个覆盖率文件路径
     method_info = os.path.join(baseInfoDir, bugid, 'failcov', 'method_info.txt')
+    # 新增的 failDir 目录路径
+    failDir = os.path.join(baseFailDir, bugid, 'failcov')
 
     print(f"\n==============================================")
-    print(f"🛡️ 开始基于动态覆盖率 (method_info.txt) 剔除未执行函数")
+    print(f"🛡️ 开始基于多维动态覆盖率 (method_info.txt) 剔除未执行函数")
     print(f"==============================================\n")
 
-    # 1. 获取所有被实际执行过的函数签名
-    print("🔄 正在调用 c++filt 还原覆盖率文件中的修饰名...")
-    executed_sigs = get_executed_demangled_functions(method_info)
-    print(f"✅ 成功获取 {len(executed_sigs)} 个已被执行的底层函数签名。\n")
+    # 1. 收集所有相关的 method_info.txt 路径
+    all_method_info_paths = []
 
-    if not executed_sigs:
-        print("⚠️ 警告：覆盖率列表为空，将跳过过滤保护原数据。")
+    # 加入基础的 method_info
+    if os.path.exists(method_info):
+        all_method_info_paths.append(method_info)
+
+    # 遍历 failDir 寻找所有子文件夹中的 method_info.txt
+    if os.path.exists(failDir):
+        for entry in os.listdir(failDir):
+            sub_dir_path = os.path.join(failDir, entry)
+            if os.path.isdir(sub_dir_path):
+                sub_method_info = os.path.join(sub_dir_path, 'method_info.txt')
+                if os.path.exists(sub_method_info):
+                    all_method_info_paths.append(sub_method_info)
+
+    if not all_method_info_paths:
+        print("⚠️ 警告：未找到任何覆盖率文件，将跳过过滤保护原数据。")
         return
 
-    # 2. 遍历 LLM 生成的 *_functions.md 文件
+    # 2. 获取所有被实际执行过的函数签名 (求交集)
+    print(f"🔄 正在从 {len(all_method_info_paths)} 个覆盖率文件中调用 c++filt 还原修饰名并求交集...")
+
+    common_executed_sigs = None
+
+    for path in all_method_info_paths:
+        sigs = get_executed_demangled_functions(path)
+
+        # 如果是第一个文件，直接作为初始基准集合
+        if common_executed_sigs is None:
+            common_executed_sigs = set(sigs)
+        else:
+            # 否则，与当前集合求交集
+            common_executed_sigs.intersection_update(sigs)
+
+        # 性能优化与安全检查：如果交集已经为空，说明没有共同执行的函数，提前退出循环
+        if not common_executed_sigs:
+            print(f"⚠️ 注意：在与文件 {path} 取交集后，共同执行的函数集合已变为空！")
+            break
+
+    # 防御性编程，处理全是空文件的情况
+    if common_executed_sigs is None:
+        common_executed_sigs = set()
+
+    print(f"✅ 成功获取 {len(common_executed_sigs)} 个在【所有】失败用例中都执行过的核心函数签名。\n")
+
+    if not common_executed_sigs:
+        print("⚠️ 警告：没有找到在所有失败用例中共同执行的函数（交集为空），跳过过滤以保护原数据。")
+        return
+
+    # 3. 遍历 LLM 生成的 *_functions.md 文件
     filtered_count = 0
     retained_count = 0
 
@@ -226,8 +272,8 @@ def is_function_exe(bugid, configPath):
                 func_data = json.loads(block)
                 llm_sig = func_data.get("signature", "")
 
-                # 3. 核心比对：验证是否被执行过
-                if is_signature_match(llm_sig, executed_sigs):
+                # 4. 核心比对：验证是否在【交集】中存在
+                if is_signature_match(llm_sig, common_executed_sigs):
                     # 匹配成功，保留该 JSON 块
                     retained_blocks.append(f"```json\n{json.dumps(func_data, ensure_ascii=False, indent=2)}\n```")
                     retained_count += 1
@@ -237,7 +283,7 @@ def is_function_exe(bugid, configPath):
                 print(f"⚠️ 跳过格式错误的 JSON 块")
                 continue
 
-        # 4. 将过滤后的函数列表重新写回文件（覆盖原文件，或另存为）
+        # 5. 将过滤后的函数列表重新写回文件
         filtered_file_path = os.path.join(fileListDir, filename.replace('.md', '_filtered.md'))
         with open(filtered_file_path, 'w', encoding='utf-8') as f:
             if retained_blocks:
@@ -247,9 +293,10 @@ def is_function_exe(bugid, configPath):
 
         print(f"📄 文件: {filename}")
         print(f"   - 保留了 {len(retained_blocks)} 个有效函数")
-        print(f"   - 过滤了 {len(json_blocks) - len(retained_blocks)} 个死代码函数")
+        print(f"   - 过滤了 {len(json_blocks) - len(retained_blocks)} 个无关代码函数")
 
-    print(f"\n🎉 覆盖率清洗完成！共保留 {retained_count} 个执行函数，剔除 {filtered_count} 个未执行函数。")
+    print(
+        f"\n🎉 覆盖率清洗完成！共保留 {retained_count} 个核心执行函数，剔除 {filtered_count} 个未完全覆盖的函数。")
 
 
 def extract_log_diff(log_path):
@@ -304,7 +351,7 @@ def function_FL(bugid, configPath):
     log_diff_content = extract_log_diff(compile_log_path)
 
     # 线索 3：高危文件级排名 (提取 CSV 的前 10 行文本表现形式)
-    rank_csv_path = os.path.join(resultDir, 'final_file_rank.csv')
+    rank_csv_path = os.path.join('/home/chris/FLL-workplace/llvmbugs/result', bugid, 'aggregate_result.csv')
     file_rank_str = ""
     if os.path.exists(rank_csv_path):
         try:
@@ -315,7 +362,7 @@ def function_FL(bugid, configPath):
         except Exception as e:
             file_rank_str = f"⚠️ 读取文件排名失败: {str(e)}"
     else:
-        file_rank_str = "⚠️ final_file_rank.csv 不存在。"
+        file_rank_str = "⚠️ aggregate_result.csv 不存在。"
 
     # 线索 4：动态覆盖率验证后的候选函数库 (*_filtered.md)
     candidate_functions = []
