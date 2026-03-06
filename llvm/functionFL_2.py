@@ -157,7 +157,7 @@ def function_FL(bugid, configPath):
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=8192
+                max_tokens=10000
             )
 
             reply_text = response.choices[0].message.content
