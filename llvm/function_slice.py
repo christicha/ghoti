@@ -330,7 +330,7 @@ def generate_function_summaries(bugid, configPath):
         # 5. 调用大模型
         try:
             response = client.chat.completions.create(
-                model="deepseek-reasoner",
+                model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
