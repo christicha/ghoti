@@ -7,7 +7,7 @@ config.read('./config/config.ini', encoding='utf-8')
 compilerBasePath = config.get('llvm-locations', 'compilersdir')
 buglist = config.get('llvm-locations', 'bugList')
 infoBasePath = config.get('llvm-locations', 'infodir')
-resultBasePath =config.get('llvm-locations', 'resultDit')
+resultBasePath =config.get('llvm-locations', 'resultDir')
 fileListBasePath = config.get('llvm-locations', 'fileListDir')
 benchmarkPath = config.get('llvm-locations', 'benchmark')
 

@@ -1,9 +1,10 @@
 from configparser import ConfigParser
 
 from llvm.fileTop10 import get_top_10_files
-from llvm.functionFL_1 import is_function_exe, function_list
-from llvm.functionFL_2 import function_FL, compute_comprehensive_rank
+from llvm.functionFL_2 import function_FL, compute_comprehensive_rank, analyze_root_cause
 from llvm.function_slice import function_slice, generate_function_summaries
+from llvm.generateMutate import generateMutate
+from llvm.log import generate_logs
 
 config = ConfigParser()
 config.read('./config/config.ini', encoding='utf-8')
@@ -39,10 +40,12 @@ def process_bugid_wrapper(args):
     compileOptionRight = compileOptionRights[i]
     compileOptionWrong = compileOptionWrongs[i]
     check = checks[i]
+    # generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
-    get_top_10_files(bugid, revision, configPath)
-    function_slice(bugid, configPath)
-    generate_function_summaries(bugid, configPath)
+    # analyze_root_cause(bugid, configPath, compileOptionRight, compileOptionWrong)
+    # get_top_10_files(bugid, revision, configPath)
+    # function_slice(bugid, configPath)
+    # generate_function_summaries(bugid, configPath)
     function_FL(bugid, configPath)
     compute_comprehensive_rank(bugid, configPath)
 

@@ -6,6 +6,123 @@ from configparser import ConfigParser
 from openai import OpenAI
 
 
+def read_file_content(file_path):
+    """辅助函数：安全读取文件内容"""
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+    except Exception as e:
+        print(f"⚠️ 警告：无法读取文件 {file_path} - {str(e)}")
+    return ""
+
+
+def load_mutated_cases(case_dir):
+    """辅助函数：遍历目录并拼接所有变异的 C 文件内容"""
+    cases_content = []
+    if os.path.exists(case_dir):
+        for filename in sorted(os.listdir(case_dir)):
+            if filename.endswith(".c"):
+                content = read_file_content(os.path.join(case_dir, filename))
+                cases_content.append(
+                    f"// ====================\n// 变异文件: {filename}\n// ====================\n{content}")
+    return "\n\n".join(cases_content) if cases_content else "// 未提供此类型变异测试用例"
+
+
+def analyze_root_cause(bugid, configFile, rightOption, wrongOption):
+    cfg = ConfigParser()
+    cfg.read(configFile)
+
+    # 1. 加载路径配置
+    baseLogDir = cfg.get('llvm-locations', 'logDir')
+    baseCaseDir = cfg.get('llvm-locations', 'passdir')
+    baseInfoPath = cfg.get('llvm-locations', 'infodir')
+
+    api_key = cfg.get('deepseek', 'api')
+    api_url = cfg.get('deepseek', 'url')
+
+
+    logPath = os.path.join(baseLogDir, bugid, 'compile.log')
+    passCaseDir = os.path.join(baseCaseDir, bugid, 'passing_cases')
+    failCaseDir = os.path.join(baseCaseDir, bugid, 'failing_cases')
+    ori = os.path.join(baseInfoPath, bugid, 'fail.c')
+
+    ori_content = read_file_content(ori)
+    log_content = read_file_content(logPath)
+    fail_cases_str = load_mutated_cases(failCaseDir)
+    pass_cases_str = load_mutated_cases(passCaseDir)
+
+    if not ori_content or not log_content:
+        print("❌ 致命错误：找不到原始 fail.c 或 compile.log 文件，中止分析。")
+        return
+
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
+
+    # ==========================================
+    # 第一轮交互：根因分析 (RCA)
+    # ==========================================
+    system_prompt = (
+        "你是一位顶尖的 LLVM 编译器开发专家与程序分析研究员，精通 C 语言规范、未定义行为（UB）分析、"
+        "编译器优化管线、中间代码（IR）转换、x86-64 汇编以及基于覆盖率的缺陷定位（SBFL）理论。"
+    )
+
+    rca_prompt = f"""任务目标
+    我遇到了一起由于编译器优化等级导致的bug，编译器在{rightOption}不触发bug，在{wrongOption}触发bug。我将提供触发该 Bug 的原始代码、基于它变异的成功/失败测试用例集，以及详尽的编译阶段对比日志。请你执行深度差分分析，推导出导致该 Bug 的根因假设。
+
+    输入数据
+    1. 原始触发 Bug 的测试程序 (fail.c)
+    {ori_content}
+
+    2. 变异测试用例集 (差分数据)
+    保持 Bug 触发的变异程序 (Failing Cases):
+    {fail_cases_str}
+    不再触发 Bug 的变异程序 (Passing Cases):
+    {pass_cases_str}
+
+    3. 深度编译分析日志 ({rightOption} vs {wrongOption})
+    {log_content}
+
+    分析指令
+    第一步：差分语法与语义分析 (Test Case Delta Analysis)
+    提取出导致程序从“触发 Bug”变成“不触发 Bug”的最小关键语法或语义突变。结合 Sanitizer 日志，排除由于测试用例本身存在未定义行为（UB）的可能性。
+    第二步：汇编与编译日志映射 (Log-to-Code Mapping)
+    分析核心指令差异，利用交织反汇编，将“关键语法突变”直接映射到被错误优化掉或生成错误的底层汇编指令上。
+    第三步：编译器内部状态推导 (IR & Optimization Pass Hypothesis)
+    推断是哪一类数据流分析或控制流分析得出了错误结论，提出 2-3 个最有可能的嫌疑优化 Pass。
+
+    请以结构化的技术报告形式输出你的分析结果，必须包含以下三个标题：
+    1. 触发条件隔离
+    2. 根因假设分析
+    3. 高度嫌疑的优化 Pass
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": rca_prompt}
+    ]
+
+    print("🧠 正在呼叫大模型生成根因分析报告 (RCA)...")
+    try:
+        response_rca = client.chat.completions.create(
+            model="deepseek-reasoner",
+            messages=messages,
+            temperature=1.0,
+            max_tokens=50000
+        )
+        rca_report = response_rca.choices[0].message.content
+
+        rca_report_path = os.path.join(baseLogDir, bugid, f"root_cause.md")
+        with open(rca_report_path, 'w', encoding='utf-8') as f:
+            f.write(rca_report)
+        print(f"✅ 成功！根因分析报告已生成并保存至: {rca_report_path}")
+
+        messages.append({"role": "assistant", "content": rca_report})
+
+    except Exception as e:
+        print(f"❌ RCA 分析调用失败: {str(e)}")
+        return
+
+
 def function_FL(bugid, configPath):
     cfg = ConfigParser()
     cfg.read(configPath)
@@ -21,7 +138,10 @@ def function_FL(bugid, configPath):
     resultDir = os.path.join(baseResultDir, bugid)
     fileListDir = os.path.join(baseFileListDir, bugid)
 
-    # 获取 LLM API 配置
+    if not os.path.exists(resultDir):
+        os.mkdir(resultDir)
+
+    # 获取 LLM API 配置x
     api_key = cfg.get('deepseek', 'api')
     api_url = cfg.get('deepseek', 'url')
 
