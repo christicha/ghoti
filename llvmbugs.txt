@@ -1,3 +1,1 @@
-22641,r229830,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no
-23751,r238951,-O1,-Os,checkIsPass_zeroandsegmentoneline,install_no
-24356,r243961,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no
+15920,r181189,-O2,-O3,checkIsPass_wrongcodeOneline,install_no

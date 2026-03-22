@@ -1,7 +1,7 @@
 from configparser import ConfigParser
 
 from llvm.fileTop10 import get_top_10_files
-from llvm.functionFL_2 import function_FL, compute_comprehensive_rank, analyze_root_cause
+from llvm.functionFL_3 import function_FL
 from llvm.function_slice import function_slice, generate_function_summaries
 from llvm.generateMutate import generateMutate
 from llvm.log import generate_logs
@@ -46,8 +46,7 @@ def process_bugid_wrapper(args):
     # get_top_10_files(bugid, revision, configPath)
     # function_slice(bugid, configPath)
     # generate_function_summaries(bugid, configPath)
-    function_FL(bugid, configPath)
-    compute_comprehensive_rank(bugid, configPath)
+    function_FL(bugid, configPath, revision, compileOptionRight, compileOptionWrong)
 
     return bugid
 
