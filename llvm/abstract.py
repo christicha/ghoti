@@ -5,51 +5,101 @@ from typing import Dict
 from configparser import ConfigParser
 
 
+def parse_file_coverage(filepath: str) -> Dict[str, int]:
+    """解析单个 coverage 文件，返回 {文件名: 调用次数} 的字典"""
+    filemap: Dict[str, int] = {}
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            for line in lines:
+                items = line.split(',')
+                if len(items) < 2:  # 跳过格式异常的行
+                    continue
+
+                # 使用正则清洗文件名路径
+                filename = re.sub(r'/CMakeFiles/[^/]+\.dir', '', items[0]).split('.gcda')[0]
+
+                # 累加调用次数，并过滤掉执行次数为 0 的文件
+                try:
+                    count = int(items[-1].strip())
+                    if count > 0:
+                        filemap[filename] = filemap.get(filename, 0) + count
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"❌ 读取覆盖率文件失败 {filepath}: {str(e)}")
+
+    return filemap
+
+
 def generate_abstract_summary(bugid, configPath):
     """
-    根据执行次数和文件功能摘要文档，提取摘要信息并写入目标文件。
+    基于所有失败测试用例的覆盖率【交集】，提取文件执行次数和功能摘要，并写入目标文件。
     """
     cfg = ConfigParser()
     cfg.read(configPath)
+
     # 1. 加载路径配置
     baseLogDir = cfg.get('llvm-locations', 'logDir')
     summaryDir = cfg.get('llvm-locations', 'summaryDir')
     infoBasePath = cfg.get('llvm-locations', 'infodir')
+    baseFailDir = cfg.get('llvm-locations', 'passdir')
 
     resultPath = os.path.join(baseLogDir, bugid, 'abstract_summary.txt')
     methodcov = os.path.join(infoBasePath, bugid, 'failcov', 'method_info.txt')
+    # 失败用例的变异目录
+    failcov_dir = os.path.join(baseFailDir, bugid, 'failcov')
 
-    filemap: Dict[str, int] = {}
-
-    # 2. 读取 coverage 文件并统计调用次数
+    # 2. 收集所有失败用例的 method_info.txt 路径
+    all_method_info_paths = []
     if os.path.exists(methodcov):
-        try:
-            with open(methodcov, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                for line in lines:
-                    items = line.split(',')
-                    if len(items) < 2:  # 跳过格式异常的行
-                        continue
+        all_method_info_paths.append(methodcov)
 
-                    # 使用正则清洗文件名路径
-                    filename = re.sub(r'/CMakeFiles/[^/]+\.dir', '', items[0]).split('.gcda')[0]
+    if os.path.exists(failcov_dir):
+        for entry in os.listdir(failcov_dir):
+            sub_dir_path = os.path.join(failcov_dir, entry)
+            if os.path.isdir(sub_dir_path):
+                sub_method_info = os.path.join(sub_dir_path, 'method_info.txt')
+                if os.path.exists(sub_method_info):
+                    all_method_info_paths.append(sub_method_info)
 
-                    # 累加调用次数
-                    try:
-                        count = int(items[-1].strip())
-                        filemap[filename] = filemap.get(filename, 0) + count
-                    except ValueError:
-                        continue  # 跳过无法转换为整数的行
-        except Exception as e:
-            print(f"❌ 读取覆盖率文件失败 {methodcov}: {str(e)}")
-            return False
-    else:
-        print(f"⚠️ 警告: 覆盖率文件不存在 {methodcov}")
+    if not all_method_info_paths:
+        print(f"⚠️ 警告: 未找到任何失败用例的覆盖率文件。")
         return False
 
-    # 3. 根据 filemap 和 summaryDir 提取摘要
+    # 3. 解析所有覆盖率文件
+    all_filemaps = []
+    for path in all_method_info_paths:
+        fmap = parse_file_coverage(path)
+        if fmap:  # 只有非空的字典才加入
+            all_filemaps.append(fmap)
+
+    if not all_filemaps:
+        print(f"⚠️ 警告: 所有覆盖率文件均为空或读取失败。")
+        return False
+
+    # 4. 计算文件的【交集】
+    original_file_count = len(all_filemaps[0])  # ✅ 记录原始 info 涉及的文件数
+    common_files = set(all_filemaps[0].keys())
+
+    for fmap in all_filemaps[1:]:
+        common_files.intersection_update(fmap.keys())
+
+    if not common_files:
+        print(f"⚠️ 警告: 失败用例之间没有文件覆盖率交集 (原 info 涉及 {original_file_count} 个文件)。摘要文件将为空。")
+        final_filemap = {}
+    else:
+        # ✅ 打印原始数量和交集后的数量，展示过滤效果
+        filtered_count = original_file_count - len(common_files)
+        print(
+            f"✅ 覆盖率清洗完成！原 info 涉及 {original_file_count} 个文件，取交集后剩余 {len(common_files)} 个核心文件 (成功滤除 {filtered_count} 个噪音文件)。")
+
+        # 将交集文件的调用次数进行累加求和
+        final_filemap = {f: sum(fmap[f] for fmap in all_filemaps) for f in common_files}
+
+    # 5. 根据交集 final_filemap 和 summaryDir 提取 JSON 摘要
     result_lines = []
-    for filename, call_count in filemap.items():
+    for filename, call_count in final_filemap.items():
         temp = os.path.basename(filename)
         json_path = os.path.join(summaryDir, f"{temp}.json")
 
@@ -58,7 +108,7 @@ def generate_abstract_summary(bugid, configPath):
                 with open(json_path, 'r', encoding='utf-8') as json_file:
                     data = json.load(json_file)
                     summary = data.get('summary', '无摘要信息')
-                    result_lines.append(f"{filename}，调用次数:{call_count}：{summary}")
+                    result_lines.append(f"{filename}，总调用次数:{call_count}：{summary}")
             except json.JSONDecodeError:
                 print(f"⚠️ 警告：{filename}，调用次数:{call_count}：JSON格式错误")
             except Exception as e:
@@ -67,13 +117,16 @@ def generate_abstract_summary(bugid, configPath):
             # 如果对应 JSON 不存在，直接跳过
             continue
 
-    # 4. 尝试写入目标文件
+    # 6. 尝试写入目标文件
     try:
         # 确保目标文件所在的目录结构存在
         os.makedirs(os.path.dirname(resultPath), exist_ok=True)
 
         with open(resultPath, 'w', encoding='utf-8') as out_file:
-            out_file.write('\n'.join(result_lines))
+            if result_lines:
+                out_file.write('\n'.join(result_lines))
+            else:
+                out_file.write("无满足条件的文件摘要。")
 
         print(f"✅ 摘要信息已成功生成并写入: {resultPath}")
         return True
@@ -81,6 +134,5 @@ def generate_abstract_summary(bugid, configPath):
         print(f"❌ 写入摘要文件失败 {resultPath}: {str(e)}")
         return False
 
-
-if __name__ == "__main__":
-    generate_abstract_summary('15920', '/home/chris/ghoti/config/config.ini')
+# if __name__ == "__main__":
+#     generate_abstract_summary('15920', '/home/chris/ghoti/config/config.ini')

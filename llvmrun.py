@@ -1,10 +1,7 @@
 from configparser import ConfigParser
-
-from llvm.fileTop10 import get_top_10_files
+from llvm.abstract import generate_abstract_summary
 from llvm.functionFL_3 import function_FL
-from llvm.function_slice import function_slice, generate_function_summaries
-from llvm.generateMutate import generateMutate
-from llvm.log import generate_logs
+from llvm.rank import fileRank
 
 config = ConfigParser()
 config.read('./config/config.ini', encoding='utf-8')
@@ -42,16 +39,14 @@ def process_bugid_wrapper(args):
     check = checks[i]
     # generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
-    # analyze_root_cause(bugid, configPath, compileOptionRight, compileOptionWrong)
-    # get_top_10_files(bugid, revision, configPath)
-    # function_slice(bugid, configPath)
-    # generate_function_summaries(bugid, configPath)
+    generate_abstract_summary(bugid,configPath)
+    # fileRank(bugid, configPath)
     function_FL(bugid, configPath, revision, compileOptionRight, compileOptionWrong)
 
     return bugid
 
 
-with ProcessPoolExecutor(max_workers=9) as executor:
+with ProcessPoolExecutor(max_workers=2) as executor:
     # 提交所有任务
     future_to_bugid = {
         executor.submit(process_bugid_wrapper, (

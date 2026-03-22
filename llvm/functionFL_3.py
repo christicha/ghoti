@@ -1,14 +1,27 @@
 import os
 import re
 import json
+import shutil  # ✅ 新增：用于彻底清空文件夹
 from configparser import ConfigParser
 from openai import OpenAI
 
 from llvm.function_slice import function_slice, generate_function_summaries
 
 
-# 假设我们在同一个文件中已经有了这两个函数的定义
-# from your_module import function_slice, generate_function_summaries
+def empty_directory(folder_path):
+    """✅ 新增：清空指定文件夹下的所有内容，但保留文件夹本身"""
+    if not os.path.exists(folder_path):
+        return
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print(f"⚠️ 清理失败 {file_path}. 原因: {e}")
+
 
 def read_file_content(file_path):
     """安全读取文件内容的辅助函数"""
@@ -19,6 +32,28 @@ def read_file_content(file_path):
             return f.read()
     except Exception as e:
         return f"⚠️ 读取文件失败 {file_path}: {str(e)}"
+
+
+def get_test_cases_content(dir_path, limit=5):
+    """从指定目录中读取前 N 个测试用例文件的内容"""
+    if not os.path.exists(dir_path):
+        return "⚠️ 目录不存在或无测试用例"
+
+    # 获取目录下所有的文件，并排序保证每次读取的顺序一致
+    files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
+    files.sort()
+
+    if not files:
+        return "⚠️ 该目录下暂无文件"
+
+    content_list = []
+    for f in files[:limit]:
+        file_path = os.path.join(dir_path, f)
+        content = read_file_content(file_path)
+        # 用明显的分隔符把各个用例隔开
+        content_list.append(f"// ======== Test Case: {f} ========\n{content}")
+
+    return "\n\n".join(content_list)
 
 
 def extract_table_from_llm_response(response_text):
@@ -52,6 +87,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     baseResultDir = cfg.get('llvm-locations', 'resultDir')
     baseFileListDir = cfg.get('llvm-locations', 'fileListDir')
     baseCompilerDir = cfg.get('llvm-locations', 'compilersdir')
+    basePassDir = cfg.get('llvm-locations', 'passdir')
     summaryDir = cfg.get('llvm-locations', 'summaryDir')
     baseInfoDir = cfg.get('llvm-locations', 'infodir')
     api_key = cfg.get('deepseek', 'api')
@@ -59,18 +95,41 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
     # 定义各个文件的绝对路径
     bug_report_path = os.path.join(baseLogDir, bugid, 'bug_report.txt')
-    log_path = os.path.join(baseLogDir, bugid, 'compile.log')  # 对应你的深度编译日志
+    log_path = os.path.join('/home/chris/ghoti/benchmark/llvmbugs', bugid, 'version')
     sbfl_result = os.path.join(baseLogDir, bugid, 'SBFL.csv')
     summary_path = os.path.join(baseLogDir, bugid, 'abstract_summary.txt')
     compilerDir = os.path.join(baseCompilerDir, rev, rev, 'llvm')
+
+    passDir = os.path.join(basePassDir, bugid, 'passing_case')
+    failDir = os.path.join(basePassDir, bugid, 'failing_case')
+
     resultDir = os.path.join(baseResultDir, bugid)
-    os.makedirs(resultDir, exist_ok=True)
+    fileListDir_bugid = os.path.join(baseFileListDir, bugid)
+
+    # ==========================================
+    # ✅ 新增：在一切开始前，强制清空历史遗留的缓存文件
+    # ==========================================
+    print(f"\n🧹 正在清理 BugID: {bugid} 的历史工作区...")
+    if os.path.exists(resultDir):
+        empty_directory(resultDir)
+    else:
+        os.makedirs(resultDir, exist_ok=True)
+
+    if os.path.exists(fileListDir_bugid):
+        empty_directory(fileListDir_bugid)
+    else:
+        os.makedirs(fileListDir_bugid, exist_ok=True)
+    print("✨ 清理完成，工作区已就绪！")
 
     # 2. 读取上下文数据
     bug_report = read_file_content(bug_report_path)
     deep_compile_content = read_file_content(log_path)
     sbfl_results = read_file_content(sbfl_result)
     abstract_content = read_file_content(summary_path)
+
+    # 提前读取成功/失败变异测试用例
+    passing_cases_content = get_test_cases_content(passDir, limit=5)
+    failing_cases_content = get_test_cases_content(failDir, limit=5)
 
     # 3. 初始化 LLM 客户端与系统提示词
     client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
@@ -87,14 +146,14 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     analyzed_files_list = []
     all_functions_data = []  # 用于存储所有轮次提取的函数打分数据
 
-    print(f"\n🚀 开始执行 LLVM 缺陷定位 (BugID: {bugid}) - 10 轮分析流程")
+    print(f"\n🚀 开始执行 LLVM 缺陷定位 (BugID: {bugid}) - 20 轮分析流程")
 
     # ==========================================
-    # 🌟 核心：10 轮交互循环
+    # 🌟 核心：20 轮交互循环
     # ==========================================
-    for round_idx in range(1, 11):
+    for round_idx in range(1, 21):
         print(f"\n==========================================")
-        print(f"🔄 当前进度：第 {round_idx} 轮 / 共 10 轮")
+        print(f"🔄 当前进度：第 {round_idx} 轮 / 共 20 轮")
         print(f"==========================================")
 
         # ----------------------------------------
@@ -102,55 +161,92 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         # ----------------------------------------
         if round_idx == 1:
             prompt_file = f"""
-            【当前进度：第 1 轮 / 共 10 轮 - 阶段：锁定可疑文件】
+            【当前进度：第 1 轮 / 共 20 轮 - 阶段：锁定可疑文件】
 
             请基于以下多源信息，分析导致该失败测试用例的 Bug 根因：
-            1. === Bug 报告 ===\n{bug_report[:2000]}...
-            2. === 不同优化等级下的编译日志差异 ===\n{deep_compile_content[:6000]}...
-            3. === 基于频谱的缺陷定位 (SBFL) 结果 ===\n{sbfl_results[:2000]}...
-            4. === 文件执行次数与功能摘要 (abstract.txt) ===\n{abstract_content}...
+            1. === Bug 报告 ===\n{bug_report}...
+            2. === 不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
+            3. === 文件执行次数与功能摘要 (abstract.txt) ===\n{abstract_content}...
+            4. === 变异的成功测试用例 (参考) ===\n{passing_cases_content}
+            5. === 变异的失败测试用例 (分析) ===\n{failing_cases_content}
 
             【你的任务】
             1. 深度交叉分析上述信息，特别是优化行为的差异（如 {compilerOptionRight} 与 {compilerOptionWrong} 的 Pass 差异）与执行频次、SBFL 结果的映射关系。
-            2. 推理出导致该 Bug 的根本原因。
+            2. 结合变异测试用例中成功与失败的代码差异（重点关注哪些语法或结构导致了崩溃），推理出导致该 Bug 的根本原因。
             3. 综合所有特征，选出 1 个 你认为最有可能存在缺陷的源文件。
 
             【输出规范】
             请先给出详细的逻辑推理过程。完成推理后，在回复的最后一行，仅且只输出该文件的绝对或相对路径，不要带任何标点、反引号或额外说明。
             """
-            print(prompt_file)
+            messages.append({"role": "user", "content": prompt_file})
+
+            print(f"🧠 正在思考锁定文件...")
+            try:
+                response_file = client.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=messages,
+                    max_tokens=42000
+                ).choices[0].message.content
+                # 只有第 1 轮的回复才被加入全局上下文
+                messages.append({"role": "assistant", "content": response_file})
+            except Exception as e:
+                print(f"❌ 请求模型锁定文件时发生异常: {str(e)}")
+                print("⏭️ 放弃当前提问，重置历史并跳过本轮...")
+                messages.pop()  # 把失败的 prompt 弹出去，防止阻碍下一轮
+                continue
+
         else:
             prompt_file = f"""
-            【当前进度：第 {round_idx} 轮 / 共 10 轮 - 阶段：锁定下一个可疑文件】
+            【当前进度：第 {round_idx} 轮 / 共 20 轮 - 阶段：锁定下一个可疑文件】
             我们已经完成了对以下文件的函数级排查：
             {", ".join(analyzed_files_list)}
 
             【你的任务】
-            请回顾最开始提供的全局 Bug 上下文（编译日志差异、SBFL 结果、文件频次等），结合我们已经排查过的文件，重新评估并选出第 {round_idx} 个最有可能存在缺陷的源文件。
+            请回顾最开始提供的全局 Bug 上下文（编译日志差异、SBFL 结果、文件频次、测试用例对比等），结合我们已经排查过的文件，重新评估并选出第 {round_idx} 个最有可能存在缺陷的源文件。
 
             【输出规范】
             请给出简短的转移推理过程（为什么排除之前的，为什么选择现在的）。完成推理后，在回复的最后一行，仅且只输出新锁定的文件路径，格式与之前保持一致，且绝对不能是已经排查过的文件。
             """
-            print(prompt_file)
 
-        messages.append({"role": "user", "content": prompt_file})
+            # 🔥 阅后即焚：使用临时上下文，不污染全局 messages
+            temp_file_messages = messages + [{"role": "user", "content": prompt_file}]
 
-        # 调用大模型获取文件名
-        print(f"🧠 正在思考锁定文件...")
-        response_file = \
-        client.chat.completions.create(model="deepseek-reasoner", messages=messages, max_tokens=4096).choices[
-            0].message.content
-        messages.append({"role": "assistant", "content": response_file})
+            print(f"🧠 正在思考锁定文件...")
+            try:
+                response_file = client.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=temp_file_messages,
+                    max_tokens=42000
+                ).choices[0].message.content
+                # 🛑 绝对不要把 response_file append 进全局 messages！
+            except Exception as e:
+                print(f"❌ 请求模型锁定文件时发生异常: {str(e)}")
+                print("⏭️ 跳过本轮排查...")
+                continue
 
-        # 解析最后一行的文件路径
-        suspect_file_path = response_file.strip().split('\n')[-1].replace('`', '').strip()
+        # ----------------------------------------
+        # 💥 增强版文件路径提取逻辑：防止大模型胡言乱语
+        # ----------------------------------------
+        suspect_file_path = ""
+        for line in reversed(response_file.split('\n')):
+            cleaned_line = line.replace('`', '').replace('*', '').strip()
+            match = re.search(r'([a-zA-Z0-9_/\-\.]+\.(?:cpp|c|h|hpp))', cleaned_line)
+            if match:
+                suspect_file_path = match.group(1)
+                break
+
+        if not suspect_file_path:
+            print(f"❌ 致命错误：无法从大模型的回复中提取到有效的文件路径！")
+            print(f"大模型原始回复结尾如下：\n{response_file[-500:]}")
+            print("⏭️ 强制跳过本轮排查...")
+            continue
+
         analyzed_files_list.append(suspect_file_path)
         print(f"🎯 锁定可疑文件: {suspect_file_path}")
 
         # ----------------------------------------
         # 步骤 B：执行 AST 切割与 LLM 过滤
         # ----------------------------------------
-        # 补全完整本地路径 (依据 compilerDir 拼接)
         full_suspect_path = os.path.join(compilerDir, suspect_file_path)
 
         print("🔪 正在执行 AST 切片与摘要提纯...")
@@ -164,7 +260,6 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         filtered_md_path = os.path.join(baseFileListDir, bugid, f"{filename_only}_filtered.md")
         json_summary_path = os.path.join(summaryDir, f"{filename_only}.json")
 
-        # 读取文件的全局摘要
         file_summary = "⚠️ 暂无全局功能摘要"
         if os.path.exists(json_summary_path):
             try:
@@ -173,13 +268,18 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             except Exception:
                 pass
 
-        # 读取被保留下来的函数切片代码和摘要
         functions_data_str = read_file_content(filtered_md_path)
         if not functions_data_str or "⚠️" in functions_data_str:
             functions_data_str = "该文件没有有效的函数切片数据或被全过滤。"
 
+        # 🔥 异常保护 2：强行防爆截断 (防 OOM 强杀)
+        max_char_limit = 120000
+        if len(functions_data_str) > max_char_limit:
+            print(f"⚠️ 警告：当前文件切片极大 ({len(functions_data_str)} 字符)，执行安全截断防护...")
+            functions_data_str = functions_data_str[:max_char_limit] + "\n\n... [警告：因系统内存与上下文限制，超长后续代码已被安全截断] ..."
+
         prompt_analyze_functions = f"""
-        【当前进度：第 {round_idx} 轮 / 共 10 轮 - 阶段：下钻函数分析】
+        【当前进度：第 {round_idx} 轮 / 共 20 轮 - 阶段：下钻函数分析】
 
         我们已锁定当前可疑文件：`{suspect_file_path}`
         该文件的整体功能摘要为：`{file_summary}`
@@ -202,28 +302,41 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         |---|---|---|
         | 1 | [函数名] | [分数] |
         """
-        print(prompt_analyze_functions)
 
-        # ----------------------------------------
-        # 🔥【关键优化】：使用临时上下文，阅后即焚，不污染全局 messages！
-        # ----------------------------------------
         temp_messages = messages + [{"role": "user", "content": prompt_analyze_functions}]
 
         print(f"🔬 正在对文件内函数进行评估打分...")
-        response_funcs = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=temp_messages,
-            max_tokens=4096
-        ).choices[0].message.content
 
-        # 注意：这里我们故意省略了 messages.append(assistant_response) 来保持主干的干净
+        # 🔥 异常保护 3：函数打分异常隔离
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=temp_messages,
+                max_tokens=42000
+            )
+            message_obj = response.choices[0].message
+            response_funcs = message_obj.content or ""
+
+            # 从推理内容兜底
+            reasoning = getattr(message_obj, 'reasoning_content', "")
+            if not response_funcs and reasoning:
+                print("⚠️ 模型正式结论为空，尝试提取内部思维链...")
+                response_funcs = reasoning
+
+            if not response_funcs:
+                raise ValueError("API 返回内容完全为空")
+
+        except Exception as e:
+            print(f"❌ 对函数进行打分时发生 API 崩溃或解析异常: {str(e)}")
+            print("⏭️ 放弃当前文件的打分，安全跳入下一轮...")
+            continue  # 跳过当前这轮文件的提取保存
 
         # ----------------------------------------
         # 步骤 D：解析提取表格并赋予 File_Rank，且单独保存单文件表格
         # ----------------------------------------
         round_funcs = extract_table_from_llm_response(response_funcs)
 
-        # ✅ 【新增功能】：将每一轮的单文件函数排名结果单独保存
+        # 单文件函数排名结果单独保存
         single_round_md_path = os.path.join(resultDir, f"round_{round_idx}_{filename_only}_rank.md")
         with open(single_round_md_path, 'w', encoding='utf-8') as srf:
             srf.write(f"# 第 {round_idx} 轮函数排名 - `{filename_only}`\n\n")
@@ -273,4 +386,4 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     with open(final_ranked_md_path, 'w', encoding='utf-8') as f:
         f.write(md_content)
 
-    print(f"🎉 全部 10 轮排查完成！终极全局排行已保存至: {final_ranked_md_path}")
+    print(f"🎉 全部分析排查完成！终极全局排行已保存至: {final_ranked_md_path}")

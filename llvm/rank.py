@@ -10,12 +10,14 @@ from itertools import islice
 def deleteGcdaPath(gcdaDirName):
     return re.sub(r'/CMakeFiles/[^/]+.dir', '', gcdaDirName)
 
-def fileRank(bugId, rev, configFile):
+
+def fileRank(bugId, configFile):
     cfg = ConfigParser()
     cfg.read(configFile)
     infodir = cfg.get('llvm-locations', 'infodir')
     passdir = cfg.get('llvm-locations', 'passdir')
-    resultFile = infodir + bugId + '/SBFL.csv'
+    logDir = cfg.get('llvm-locations', 'logDir')
+    resultFile = logDir + bugId + '/SBFL.csv'
     result = open(resultFile, 'w')
     # 读取bug位置信息文件
     locationfile = open(infodir + bugId + '/locations')
