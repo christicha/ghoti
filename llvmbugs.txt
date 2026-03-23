@@ -1,2 +1,1 @@
-16552,r185684,-O2,-O3,checkIsPass_wrongcodeOneline,install_no
-16605,r186068,-m32 -O0,-m32 -O3,checkIsPass_zeroandsegmentoneline,install_no
+27868,r271236,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no

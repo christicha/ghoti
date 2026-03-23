@@ -1,7 +1,7 @@
 import os
 import re
 import json
-import shutil  # ✅ 新增：用于彻底清空文件夹
+import shutil  # ✅ 用于彻底清空文件夹
 from configparser import ConfigParser
 from openai import OpenAI
 
@@ -9,7 +9,7 @@ from llvm.function_slice import function_slice, generate_function_summaries
 
 
 def empty_directory(folder_path):
-    """✅ 新增：清空指定文件夹下的所有内容，但保留文件夹本身"""
+    """✅ 清空指定文件夹下的所有内容，但保留文件夹本身"""
     if not os.path.exists(folder_path):
         return
     for filename in os.listdir(folder_path):
@@ -107,7 +107,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     fileListDir_bugid = os.path.join(baseFileListDir, bugid)
 
     # ==========================================
-    # ✅ 新增：在一切开始前，强制清空历史遗留的缓存文件
+    # ✅ 在一切开始前，强制清空历史遗留的缓存文件
     # ==========================================
     print(f"\n🧹 正在清理 BugID: {bugid} 的历史工作区...")
     if os.path.exists(resultDir):
@@ -135,7 +135,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
 
     system_prompt = (
-        "你是一个资深的 LLVM 编译器优化缺陷分析专家。我们正在进行一个为期 10 轮的交互式缺陷定位任务。\n"
+        "你是一个资深的 LLVM 编译器优化缺陷分析专家。我们正在进行一个为期 20 轮的交互式缺陷定位任务。\n"
         "整个流程严格按照以下模式交替进行：\n"
         "1. 锁定文件：基于全局上下文（Bug报告、多优化等级编译日志差异、SBFL频谱定位、文件执行频次与功能摘要），分析并选出一个最可疑的源文件。\n"
         "2. 下钻函数：我将提供该文件中执行过的函数详情，你需要对这些函数进行可疑度打分和降序排列。\n\n"
@@ -160,7 +160,8 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         # 步骤 A：请求模型锁定一个文件
         # ----------------------------------------
         if round_idx == 1:
-            prompt_file = f"""
+            # 🔥 完整版 Prompt (仅发给模型进行第一次深度思考，包含极耗 Token 的摘要)
+            prompt_file_full = f"""
             【当前进度：第 1 轮 / 共 20 轮 - 阶段：锁定可疑文件】
 
             请基于以下多源信息，分析导致该失败测试用例的 Bug 根因：
@@ -169,26 +170,56 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             3. === 文件执行次数与功能摘要 (abstract.txt) ===\n{abstract_content}...
             4. === 变异的成功测试用例 (参考) ===\n{passing_cases_content}
             5. === 变异的失败测试用例 (分析) ===\n{failing_cases_content}
+            6. === SBFL结果 === \n{sbfl_results[:2500]}
 
             【你的任务】
-            1. 深度交叉分析上述信息，特别是优化行为的差异（如 {compilerOptionRight} 与 {compilerOptionWrong} 的 Pass 差异）与执行频次、SBFL 结果的映射关系。
+            1. 深度交叉分析上述信息，特别是优化行为的差异（如 {compilerOptionRight} 与 {compilerOptionWrong} 的 Pass 差异）与执行频次、文件功能摘要。
             2. 结合变异测试用例中成功与失败的代码差异（重点关注哪些语法或结构导致了崩溃），推理出导致该 Bug 的根本原因。
             3. 综合所有特征，选出 1 个 你认为最有可能存在缺陷的源文件。
 
             【输出规范】
             请先给出详细的逻辑推理过程。完成推理后，在回复的最后一行，仅且只输出该文件的绝对或相对路径，不要带任何标点、反引号或额外说明。
             """
-            messages.append({"role": "user", "content": prompt_file})
+
+            # 🍃 精简版 Prompt (去除了摘要，用于长久保存在全局上下文中，极大节省 Token)
+            prompt_file_lite = f"""
+            【初始分析基准】
+            以下是引发问题的核心背景信息：
+            1. === Bug 报告 ===\n{bug_report}...
+            2. === 不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
+            3. === 变异的成功测试用例 (参考) ===\n{passing_cases_content}
+            4. === 变异的失败测试用例 (分析) ===\n{failing_cases_content}
+            5. === SBFL结果 === \n{sbfl_results[:2500]}
+            """
+
+            # 使用完整版提问
+            messages.append({"role": "user", "content": prompt_file_full})
 
             print(f"🧠 正在思考锁定文件...")
             try:
-                response_file = client.chat.completions.create(
+                response = client.chat.completions.create(
                     model="deepseek-reasoner",
                     messages=messages,
-                    max_tokens=42000
-                ).choices[0].message.content
-                # 只有第 1 轮的回复才被加入全局上下文
+                    max_tokens=35000
+                )
+                message_obj = response.choices[0].message
+                response_file = message_obj.content or ""
+
+                # 兜底：如果正式结论为空，尝试提取内部思维链
+                reasoning = getattr(message_obj, 'reasoning_content', "")
+                if not response_file and reasoning:
+                    print("⚠️ 模型正式结论为空，尝试提取内部思维链...")
+                    response_file = reasoning
+
+                if not response_file:
+                    raise ValueError("API 返回内容完全为空")
+
+                # 🔥 移花接木：将发出去的完整版 User Prompt 替换为去除了摘要的精简版
+                messages[-1] = {"role": "user", "content": prompt_file_lite}
+
+                # 将第 1 轮的绝佳推理完整加入全局上下文
                 messages.append({"role": "assistant", "content": response_file})
+
             except Exception as e:
                 print(f"❌ 请求模型锁定文件时发生异常: {str(e)}")
                 print("⏭️ 放弃当前提问，重置历史并跳过本轮...")
@@ -213,11 +244,22 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
             print(f"🧠 正在思考锁定文件...")
             try:
-                response_file = client.chat.completions.create(
+                response = client.chat.completions.create(
                     model="deepseek-reasoner",
                     messages=temp_file_messages,
-                    max_tokens=42000
-                ).choices[0].message.content
+                    max_tokens=40000
+                )
+                message_obj = response.choices[0].message
+                response_file = message_obj.content or ""
+
+                reasoning = getattr(message_obj, 'reasoning_content', "")
+                if not response_file and reasoning:
+                    print("⚠️ 模型正式结论为空，尝试提取内部思维链...")
+                    response_file = reasoning
+
+                if not response_file:
+                    raise ValueError("API 返回内容完全为空")
+
                 # 🛑 绝对不要把 response_file append 进全局 messages！
             except Exception as e:
                 print(f"❌ 请求模型锁定文件时发生异常: {str(e)}")
@@ -312,7 +354,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             response = client.chat.completions.create(
                 model="deepseek-reasoner",
                 messages=temp_messages,
-                max_tokens=42000
+                max_tokens=40000
             )
             message_obj = response.choices[0].message
             response_funcs = message_obj.content or ""

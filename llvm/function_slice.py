@@ -345,7 +345,7 @@ def generate_function_summaries(bugid, configPath, target_file_path):
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.1,
-            max_tokens=8192
+            max_tokens=40000
         )
 
         reply_text = response.choices[0].message.content
