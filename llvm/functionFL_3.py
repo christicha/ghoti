@@ -8,6 +8,51 @@ from openai import OpenAI
 from llvm.function_slice import function_slice, generate_function_summaries
 
 
+def get_mutant_logs_content(mutants_log_dir, case_type, limit=5):
+    """
+    智能读取变异体日志：精准提取“运行结果”、“源码交织反汇编（案发现场）”与“差异对比”。
+    剥离冗长的 AST 和原始 IR，确保 LLM 拥有最高质量的 Debug 上下文。
+    :param case_type: "pass" 或 "fail"
+    """
+    content = ""
+    count = 0
+
+    if not os.path.exists(mutants_log_dir):
+        return f"未找到变异体日志存储目录: {mutants_log_dir}\n"
+
+    for root, dirs, files in os.walk(mutants_log_dir):
+        if os.path.basename(root).startswith(case_type):
+            for file in files:
+                if file.endswith("_compile.log"):
+                    log_path = os.path.join(root, file)
+                    with open(log_path, 'r', encoding='utf-8') as f:
+                        raw_text = f.read()
+
+                        # 1. 提取运行结果 (掐头)
+                        run_res = re.search(r'(\[1\. 运行结果\].*?)\n\n\[2\.', raw_text, re.DOTALL)
+                        run_info = run_res.group(1) if run_res else "未提取到运行状态"
+
+                        # 2. 提取源码交织反汇编 (留腹 - 找 Bug 最关键的案发现场！)
+                        # 正则匹配从 [5. 源码交织反汇编] 开始，直到遇到下一个分隔符 (===或🚨)
+                        asm_res = re.search(r'(\[5\. 源码交织反汇编 \(重点对齐区\)\].*?)(?=\n={80,}|\n【🚨)', raw_text,
+                                            re.DOTALL)
+                        asm_info = asm_res.group(1) if asm_res else "未提取到交织反汇编"
+
+                        # 3. 提取核心差异分析 (留尾)
+                        diff_res = re.search(r'(【🚨 核心差异对比分析】.*)', raw_text, re.DOTALL)
+                        diff_info = diff_res.group(1) if diff_res else "未提取到差异分析"
+
+                        content += f"=== 变异体分析 ({case_type.upper()} 用例 {count + 1}): {file} ===\n"
+                        content += f"{run_info}\n\n{asm_info}\n\n{diff_info}\n"
+                        content += "-" * 80 + "\n\n"
+
+                    count += 1
+                    if count >= limit:
+                        return content
+
+    return content or f"暂无 {case_type} 类型的变异体日志。\n"
+
+
 def empty_directory(folder_path):
     """✅ 清空指定文件夹下的所有内容，但保留文件夹本身"""
     if not os.path.exists(folder_path):
@@ -106,6 +151,9 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     resultDir = os.path.join(baseResultDir, bugid)
     fileListDir_bugid = os.path.join(baseFileListDir, bugid)
 
+    # 定义变异体日志的统一存放根目录 (对应上一版代码生成的目录)
+    mutants_log_dir = os.path.join(baseLogDir, bugid, "mutants_logs")
+
     # ==========================================
     # ✅ 在一切开始前，强制清空历史遗留的缓存文件
     # ==========================================
@@ -121,15 +169,16 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         os.makedirs(fileListDir_bugid, exist_ok=True)
     print("✨ 清理完成，工作区已就绪！")
 
-    # 2. 读取上下文数据
+    # 2. 读取基础上下文数据
     bug_report = read_file_content(bug_report_path)
     deep_compile_content = read_file_content(log_path)
     sbfl_results = read_file_content(sbfl_result)
     abstract_content = read_file_content(summary_path)
 
-    # 提前读取成功/失败变异测试用例
-    passing_cases_content = get_test_cases_content(passDir, limit=5)
-    failing_cases_content = get_test_cases_content(failDir, limit=5)
+    # 【核心修改点】改为读取变异用例的差分编译日志，并使用上方的智能压缩函数
+    print("📂 正在提取并压缩变异用例的编译分析日志...")
+    passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=5)
+    failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=5)
 
     # 3. 初始化 LLM 客户端与系统提示词
     client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
@@ -144,7 +193,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
     messages = [{"role": "system", "content": system_prompt}]
     analyzed_files_list = []
-    all_functions_data = []  # 用于存储所有轮次提取的函数打分数据
+    all_functions_data = []
 
     print(f"\n🚀 开始执行 LLVM 缺陷定位 (BugID: {bugid}) - 20 轮分析流程")
 
@@ -160,35 +209,31 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         # 步骤 A：请求模型锁定一个文件
         # ----------------------------------------
         if round_idx == 1:
-            # 🔥 完整版 Prompt (仅发给模型进行第一次深度思考，包含极耗 Token 的摘要)
+            # 🔥 完整版 Prompt (更新为变异体【编译日志】)
             prompt_file_full = f"""
-            【当前进度：第 1 轮 / 共 20 轮 - 阶段：锁定可疑文件】
+                【当前进度：第 1 轮 / 共 20 轮 - 阶段：锁定可疑文件】
 
-            请基于以下多源信息，分析导致该失败测试用例的 Bug 根因：
-            1. === Bug 报告 ===\n{bug_report}...
-            2. === 不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
-            3. === 文件执行次数与功能摘要 (abstract.txt) ===\n{abstract_content}...
-            4. === 变异的成功测试用例 (参考) ===\n{passing_cases_content}
-            5. === 变异的失败测试用例 (分析) ===\n{failing_cases_content}
-            6. === SBFL结果 === \n{sbfl_results[:2500]}
+                请基于以下多源信息，深度分析导致该失败测试用例的编译器 Bug 根因：
+                1. === Bug 报告 ===\n{bug_report}...
+                2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
+                3. === 编译器源文件执行次数与功能摘要 (abstract.txt) ===\n{abstract_content}...
+                4. === SBFL 频谱定位结果 === \n{sbfl_results[:2500]}
 
-            【你的任务】
-            1. 深度交叉分析上述信息，特别是优化行为的差异（如 {compilerOptionRight} 与 {compilerOptionWrong} 的 Pass 差异）与执行频次、文件功能摘要。
-            2. 结合变异测试用例中成功与失败的代码差异（重点关注哪些语法或结构导致了崩溃），推理出导致该 Bug 的根本原因。
-            3. 综合所有特征，选出 1 个 你认为最有可能存在缺陷的源文件。
-
-            【输出规范】
-            请先给出详细的逻辑推理过程。完成推理后，在回复的最后一行，仅且只输出该文件的绝对或相对路径，不要带任何标点、反引号或额外说明。
-            """
+                以下是针对该缺陷代码生成的变异体测试用例（Mutants）的深度编译对比日志。
+                通过对比成功变异体与失败变异体在后端的指令突变情况，推断哪个 LLVM Pass 出现了异常：
+                5. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
+                6. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
+                """
+            print(prompt_file_full)
 
             # 🍃 精简版 Prompt (去除了摘要，用于长久保存在全局上下文中，极大节省 Token)
             prompt_file_lite = f"""
             【初始分析基准】
             以下是引发问题的核心背景信息：
             1. === Bug 报告 ===\n{bug_report}...
-            2. === 不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
-            3. === 变异的成功测试用例 (参考) ===\n{passing_cases_content}
-            4. === 变异的失败测试用例 (分析) ===\n{failing_cases_content}
+            2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
+            3. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
+            4. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
             5. === SBFL结果 === \n{sbfl_results[:2500]}
             """
 

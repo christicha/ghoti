@@ -1,1 +1,1 @@
-27868,r271236,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no
+24516,r245480,-O1,-Os,checkIsPass_wrongcodeOneline,install_no
