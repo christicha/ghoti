@@ -47,7 +47,7 @@ def process_bugid_wrapper(args):
     return bugid
 
 
-with ProcessPoolExecutor(max_workers=3) as executor:
+with ProcessPoolExecutor(max_workers=1) as executor:
     # 提交所有任务
     future_to_bugid = {
         executor.submit(process_bugid_wrapper, (

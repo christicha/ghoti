@@ -9,6 +9,8 @@ from collections import Counter
 from configparser import ConfigParser
 
 
+# ======================== 基础工具函数 ========================
+
 def run_executable(exe_path):
     """运行可执行文件（使用绝对路径，并捕获所有输出）"""
     exe_abs_path = os.path.abspath(exe_path)
@@ -87,11 +89,12 @@ def get_interleaved_asm(obj_file):
 
 
 def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
-    """拆解编译阶段并收集详尽日志"""
+    """拆解编译阶段并收集详尽日志 (原汁原味保留)"""
     logs = {"preprocess": "", "ast": "", "ir_raw": "", "ir_opt": "", "ir_all_passes": "", "asm": "", "opt_passes": "",
             "backend": "", "interleaved_asm": ""}
     flags_list = shlex.split(flags_str)
 
+    # 1. 预处理
     try:
         pre_cmd = [compiler, src] + flags_list + ["-E", "-x", "c", "-o", f"{output_prefix}.i"]
         subprocess.run(pre_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
@@ -99,6 +102,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["preprocess"] = f"预处理失败：{str(e)}\n"
 
+    # 2. AST分析
     try:
         ast_cmd = [compiler, src] + flags_list + ["-Xclang", "-ast-dump", "-fsyntax-only"]
         ast_result = subprocess.run(ast_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -108,6 +112,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["ast"] = f"AST生成异常：{str(e)}\n"
 
+    # 3. 未优化 IR
     try:
         ir_raw_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-O0", "-o", f"{output_prefix}_raw.ll"]
         subprocess.run(ir_raw_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -115,6 +120,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["ir_raw"] = f"未优化IR生成失败：{str(e)}\n"
 
+    # 4. 优化后 IR & Pass 详情 & 全程 IR 快照
     try:
         ir_opt_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-o", f"{output_prefix}_opt.ll", "-mllvm",
                                                      "-debug-pass=Arguments"]
@@ -138,6 +144,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["ir_opt"] = f"优化IR生成失败：{str(e)}\n"
 
+    # 5. 汇编代码
     try:
         asm_cmd = [compiler, src] + flags_list + ["-S", "-fverbose-asm", "-g", "-o", f"{output_prefix}.s"]
         subprocess.run(asm_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -145,6 +152,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["asm"] = f"汇编生成失败：{str(e)}\n"
 
+    # 6. 后端生成
     try:
         backend_cmd = [compiler, src] + flags_list + ["-g", "-c", "-o", f"{output_prefix}.o"]
         subprocess.run(backend_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -156,155 +164,146 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     return logs
 
 
-# ======================== 新增极速核心：手动 Delta Debugging 引擎 ========================
-def run_manual_pass_reduction(bin_dir, src_path, good_output, work_dir):
-    """
-    自己实现一个鲁棒的增量删减工具（完全抛弃会崩溃的 bugpoint）
-    """
+# ======================== 核心改进：动态获取 Pass 并缩减 ========================
+
+def get_llvm_pass_arguments(bin_dir, opt_level_flag):
+    """根据优化级别（如-Os, -O3）动态提取 Pass 序列 (已修复 TypeError)"""
+    opt_exe = os.path.join(bin_dir, 'opt')
+    clang_exe = os.path.join(bin_dir, 'clang')
+    dummy_ll = "temp_dummy.ll"
+    dummy_bc = "temp_dummy.bc"
+
+    with open(dummy_ll, "w") as f:
+        f.write("define i32 @main() { ret i32 0 }\n")
+
+    try:
+        subprocess.run([clang_exe, "-c", "-emit-llvm", dummy_ll, "-o", dummy_bc], stderr=subprocess.DEVNULL)
+        cmd = [opt_exe, opt_level_flag, "-disable-output", "-debug-pass=Arguments", dummy_bc]
+
+        # 修复点：stderr 被重定向到 stdout 后，需从 stdout 读取内容
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        output_text = res.stdout if res.stdout else ""
+        all_args = re.findall(r'-(?:[\w-]+)', output_text)
+
+        exclude = {'-disable-output', '-debug-pass', opt_level_flag}
+        final_passes = [p for p in all_args if p not in exclude]
+
+        for f in [dummy_ll, dummy_bc]:
+            if os.path.exists(f): os.remove(f)
+        return final_passes
+    except Exception as e:
+        print(f"动态获取 Pass 失败: {str(e)}")
+        return []
+
+
+def run_manual_pass_reduction(bin_dir, src_path, opt_level, good_output, work_dir):
+    """通用 Delta Debugging 引擎：支持动态 Pass 序列"""
     opt_exe = os.path.abspath(os.path.join(bin_dir, 'opt'))
     llc_exe = os.path.abspath(os.path.join(bin_dir, 'llc'))
     clang_exe = os.path.abspath(os.path.join(bin_dir, 'clang'))
 
-    log_info = "\n【🛠️ 自定义自动化 Pass 贪心缩减定位报告】\n" + "=" * 100 + "\n"
+    log_info = f"\n【🛠️ 动态自动化 Pass 缩减定位报告 - {opt_level}】\n" + "=" * 100 + "\n"
 
-    # 根据之前 -O3 的报错日志，提取的典型 LLVM 3.x -O3 pass 序列。
-    # 🚨 已主动移除让 opt 崩溃的 `-simplify-libcalls`
-    initial_passes = [
-        "-tbaa", "-basicaa", "-simplifycfg", "-sroa", "-early-cse", "-lower-expect",
-        "-tbaa", "-basicaa", "-globalopt", "-ipsccp", "-deadargelim", "-instcombine",
-        "-simplifycfg", "-prune-eh", "-inline", "-functionattrs", "-sroa", "-early-cse",
-        "-jump-threading", "-correlated-propagation", "-simplifycfg", "-instcombine",
-        "-tailcallelim", "-simplifycfg", "-reassociate", "-loop-rotate", "-licm",
-        "-loop-unswitch", "-instcombine", "-indvars", "-loop-idiom", "-loop-deletion",
-        "-loop-unroll", "-gvn", "-memcpyopt", "-sccp", "-instcombine", "-jump-threading",
-        "-correlated-propagation", "-dse", "-adce", "-simplifycfg", "-instcombine",
-        "-strip-dead-prototypes", "-globaldce", "-constmerge"
-    ]
+    # 1. 动态获取初始 Pass 序列
+    initial_passes = get_llvm_pass_arguments(bin_dir, opt_level)
+    if not initial_passes:
+        return log_info + "❌ 无法提取 Pass 序列，缩减引擎无法启动。\n"
 
     bc_raw = os.path.join(work_dir, "reducer_raw.bc")
     bc_opt = os.path.join(work_dir, "reducer_opt.bc")
     obj_out = os.path.join(work_dir, "reducer_out.o")
     exe_out = os.path.join(work_dir, "reducer_exe")
 
-    # 1. 使用 Clang 吐出最基础的无优化 IR
-    try:
-        subprocess.run([clang_exe, "-O0", "-emit-llvm", "-c", src_path, "-o", bc_raw], check=True)
-    except Exception as e:
-        return log_info + f"❌ 生成基础 Bitcode 失败，无法进行缩减: {str(e)}\n"
+    subprocess.run([clang_exe, "-O0", "-emit-llvm", "-c", src_path, "-o", bc_raw], check=True)
 
-    # 核心判断逻辑函数
     def check_if_bug_exists(pass_list):
-        # (1) 运行 opt 进行特定序列的优化
-        if subprocess.run([opt_exe] + pass_list + [bc_raw, "-o", bc_opt], stderr=subprocess.DEVNULL).returncode != 0:
-            return False  # Pass组合不兼容，跳过
-
-        # (2) 运行 llc 将 IR 编译成目标文件
-        if subprocess.run([llc_exe, "-filetype=obj", bc_opt, "-o", obj_out], stderr=subprocess.DEVNULL).returncode != 0:
+        if subprocess.run([opt_exe] + pass_list + [bc_raw, "-o", bc_opt],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
             return False
-
-        # (3) 运行 gcc 链接 (必须加 -no-pie 兼容旧版 llc 输出)
-        if subprocess.run(["gcc", "-no-pie", obj_out, "-lm", "-o", exe_out], stderr=subprocess.DEVNULL).returncode != 0:
+        if subprocess.run([llc_exe, "-filetype=obj", bc_opt, "-o", obj_out],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
             return False
-
-        # (4) 运行并验证最终输出
+        if subprocess.run(["gcc", "-no-pie", obj_out, "-lm", "-o", exe_out],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+            return False
         try:
             res = subprocess.run([exe_out], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3)
-            # 只要崩溃了，或者输出不是我们预期的正确值，说明 Bug 仍在！
-            if res.returncode != 0 or res.stdout.strip() != good_output:
-                return True
-        except subprocess.TimeoutExpired:
-            return True  # 死循环视同为 Bug 复现
+            return res.returncode != 0 or res.stdout.strip() != good_output
+        except:
+            return True
 
-        return False  # 跑出了正确的参照结果，说明由于少了某个 Pass，Bug 消失了
-
-    print(f"  -> 🤖 [手动缩减引擎] 初始化完成，共捕获 {len(initial_passes)} 个 Pass。")
-    print(f"  -> 正在验证初始序列...")
+    print(f"  -> 🤖 动态获取到 {len(initial_passes)} 个 Pass，正在缩减...")
 
     if not check_if_bug_exists(initial_passes):
-        log_info += "❌ 初始的 Pass 序列无法复现 Bug（程序输出了正确答案）。\n可能是该 Bug 高度依赖某个隐藏配置，缩减中止。\n"
-        return log_info
-
-    log_info += "✅ 初始序列复现 Bug 成功，开始贪心反向剔除无辜 Pass...\n"
-    print(f"  -> 初始序列验证成功！开始反向贪心剔除...")
+        return log_info + f"❌ 初始 Pass 序列 ({opt_level}) 无法复现 Bug，可能需要额外的 Clang 参数。\n"
 
     current_passes = initial_passes.copy()
-    removed_count = 0
     i = len(current_passes) - 1
-
-    # Delta Debugging: 反向贪心遍历
     while i >= 0:
-        # 尝试拿掉第 i 个 Pass
         test_list = current_passes[:i] + current_passes[i + 1:]
-
-        # 如果拿掉后 Bug 依然存在，说明这个 Pass 是没有用的，彻底抛弃它
         if check_if_bug_exists(test_list):
             current_passes = test_list
-            removed_count += 1
-
+            print(f"  [+] 成功剔除，剩余 Pass 数: {len(current_passes)}")
         i -= 1
 
-    log_info += f"\n🎯【寻凶成功】通过 Delta Debugging 引擎，共剔除了 {removed_count} 个无关 Pass！\n"
-    log_info += f"最终锁定导致错译的最小核心 Pass 序列 ({len(current_passes)} 个):\n  "
+    log_info += f"🎯 最终锁定导致问题的最小核心 Pass 序列 ({len(current_passes)} 个):\n  "
     log_info += "\n  ".join(current_passes) + "\n\n"
-    log_info += "你可以使用以下命令手动复现：\n"
-    log_info += f"{opt_exe} {' '.join(current_passes)} {bc_raw} -o trigger.bc\n"
-
+    log_info += f"复现命令：\n{opt_exe} {' '.join(current_passes)} {bc_raw} -o buggy.bc\n"
     return log_info
 
 
+# ======================== 主控函数 ========================
+
 def generate_logs(bugid, rev, configFile, rightOption, wrongOption):
-    """主控函数"""
+    """主控函数：完整保留所有日志收集阶段"""
     cfg = ConfigParser()
     cfg.read(configFile)
     infoBasePath = cfg.get('llvm-locations', 'infodir')
     compilerBasePath = cfg.get('llvm-locations', 'compilersdir')
     logBaseDir = cfg.get('llvm-locations', 'logDir')
 
-    if not os.path.exists(logBaseDir + bugid):
-        os.makedirs(logBaseDir + bugid)
+    work_dir = os.path.join(logBaseDir, bugid)
+    if not os.path.exists(work_dir): os.makedirs(work_dir)
 
     source_file = os.path.join(infoBasePath, bugid, 'fail.c')
-    fail_c_path = os.path.join(logBaseDir, bugid, 'fail.c')
+    fail_c_path = os.path.join(work_dir, 'fail.c')
     if not os.path.exists(fail_c_path):
         shutil.copyfile(source_file, fail_c_path)
 
     bin_dir = os.path.join(compilerBasePath, rev, f'{rev}-build', 'bin')
     compiler = os.path.join(bin_dir, 'clang')
-    log_file = os.path.join(logBaseDir, bugid, "compile.log")
+    log_file = os.path.join(work_dir, "compile.log")
 
-    compile_configs = [
-        {"label": "【参照组 - 正确表现】", "flags": rightOption, "prefix": os.path.join(logBaseDir, bugid, "pass_cfg")},
-        {"label": "【对照组 - 触发Bug】", "flags": wrongOption, "prefix": os.path.join(logBaseDir, bugid, "fail_cfg")}
-    ]
-
-    print(f"🚀 开始为 BugID: {bugid} 生成差分编译日志...")
+    print(f"🚀 开始为 BugID: {bugid} 生成差分编译日志 (触发级别: {wrongOption})...")
 
     with open(log_file, 'w', encoding='utf-8') as f:
         f.write(f"【深度编译差分分析报告】 | BugID: {bugid}\n")
         f.write(f"编译器: {compiler}\n")
         f.write("=" * 100 + "\n\n")
-        # 0. Sanitizer
-        f.write(run_sanitizer_check(compiler, fail_c_path, os.path.join(logBaseDir, bugid, "sanitizer_check")))
+        f.write(run_sanitizer_check(compiler, fail_c_path, os.path.join(work_dir, "sanitizer_check")))
         f.write("=" * 100 + "\n\n")
 
-    run_results = []
+    compile_configs = [
+        {"label": "【参照组 - 正确表现】", "flags": rightOption, "prefix": os.path.join(work_dir, "pass_cfg")},
+        {"label": "【对照组 - 触发Bug】", "flags": wrongOption, "prefix": os.path.join(work_dir, "fail_cfg")}
+    ]
 
-    # 1. 编译和生成日志
+    run_results = []
     for cfg_dict in compile_configs:
         exe_path = cfg_dict["prefix"] + "_exe"
-        flags_list = shlex.split(cfg_dict["flags"])
-        full_cmd = [compiler, fail_c_path] + flags_list + ["-march=x86-64", "-g", "-v", "-o", exe_path]
+        full_cmd = [compiler, fail_c_path] + shlex.split(cfg_dict["flags"]) + ["-march=x86-64", "-g", "-v", "-o",
+                                                                               exe_path]
 
-        print(f"  -> 分析配置: {cfg_dict['label']} -> {cfg_dict['flags']}")
+        print(f"  -> 分析配置: {cfg_dict['label']}")
         start_time = time.time()
         compile_result = subprocess.run(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         duration = round(time.time() - start_time, 2)
-        compile_success = compile_result.returncode == 0
 
-        exe_exists, exe_abs_path = fix_executable_permission(exe_path) if compile_success else (False, "")
+        exe_exists, exe_abs_path = fix_executable_permission(exe_path) if compile_result.returncode == 0 else (
+        False, "")
         run_res = run_executable(exe_abs_path) if exe_exists else {"success": False, "exit_code": -3, "output": "N/A",
                                                                    "error": "编译失败"}
-
         run_results.append(run_res)
 
         stage_logs = get_detailed_compile_logs(compiler, fail_c_path, cfg_dict["flags"], cfg_dict["prefix"])
@@ -312,29 +311,26 @@ def generate_logs(bugid, rev, configFile, rightOption, wrongOption):
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"{cfg_dict['label']} 深度追踪\n")
             f.write(
-                f"状态: {'✅成功' if compile_success else '❌失败'} | 退出码: {run_res['exit_code']} | 耗时: {duration}s\n")
+                f"状态: {'✅成功' if compile_result.returncode == 0 else '❌失败'} | 退出码: {run_res['exit_code']} | 耗时: {duration}s\n")
             f.write(f"输出: {run_res['output']}\n\n")
             f.write(f"[预处理与 AST]\n{stage_logs['ast']}")
             f.write(f"[LLVM IR 快照]\n{stage_logs['ir_all_passes']}")
             f.write(f"[汇编与后端]\n{stage_logs['interleaved_asm']}\n")
             f.write("=" * 100 + "\n\n")
 
-    # 2. 手动引擎提取 Pass
-    print("  -> 分析运行结果状态...")
     res_right, res_wrong = run_results[0], run_results[1]
-
-    # 检测逻辑：如果参照组正常，且与触发组存在行为差异，则触发自定义 Pass 缩小引擎
     if res_right["exit_code"] == 0 and (res_wrong["exit_code"] != 0 or res_right["output"] != res_wrong["output"]):
-        bp_log = run_manual_pass_reduction(
+        reduction_log = run_manual_pass_reduction(
             bin_dir=bin_dir,
             src_path=fail_c_path,
+            opt_level=wrongOption,
             good_output=res_right["output"],
-            work_dir=os.path.join(logBaseDir, bugid)
+            work_dir=work_dir
         )
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(bp_log)
+            f.write(reduction_log)
     else:
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write("\n【ℹ️ 分析提示】未检测到两组运行表现存在差异，无需执行 Pass 缩减。\n")
 
-    print(f"✅ 任务完成！极致缩减的 Pass 寻凶结果已输出至：{log_file}")
+    print(f"✅ 任务完成！结果已存至：{log_file}")
