@@ -40,9 +40,9 @@ def process_bugid_wrapper(args):
     check = checks[i]
     generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
-    generate_abstract_summary(bugid,configPath)
-    fileRank(bugid, configPath)
-    function_FL(bugid, configPath, revision, compileOptionRight, compileOptionWrong)
+    # generate_abstract_summary(bugid,configPath)
+    # fileRank(bugid, configPath)
+    # function_FL(bugid, configPath, revision, compileOptionRight, compileOptionWrong)
 
     return bugid
 
