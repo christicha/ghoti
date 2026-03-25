@@ -221,9 +221,13 @@ def function_slice(bugid, configPath, target_file_path):
 # ==========================================
 # 模块 3: 单文件 LLM 提纯摘要
 # ==========================================
+# ==========================================
+# 模块 3: 单文件 LLM 提纯摘要 (修改版)
+# ==========================================
 def generate_function_summaries(bugid, configPath, target_file_path):
     """
     单文件提纯版：读取指定文件的 AST 切片，调用 LLM 生成摘要并过滤无效函数。
+    保存两份：一份带函数体 (_with_body.md)，一份不带函数体 (_no_body.md)。
     """
     cfg = ConfigParser()
     cfg.read(configPath)
@@ -235,17 +239,20 @@ def generate_function_summaries(bugid, configPath, target_file_path):
     api_key = cfg.get('deepseek', 'api')
     api_url = cfg.get('deepseek', 'url')
 
-    # 根据传入的目标文件路径，推断出过滤文件的名称
     orig_filename = os.path.basename(target_file_path)
     filtered_filename = f"{orig_filename}_filtered.md"
-    file_path = os.path.join(fileListDir, filtered_filename)
+    input_file_path = os.path.join(fileListDir, filtered_filename)
+
+    # 定义两个输出文件名
+    output_path_with_body = os.path.join(fileListDir, f"{orig_filename}_with_body.md")
+    output_path_no_body = os.path.join(fileListDir, f"{orig_filename}_no_body.md")
 
     print(f"\n==============================================")
     print(f"📝 开始提纯单文件切片: {filtered_filename}")
     print(f"==============================================\n")
 
-    if not os.path.exists(file_path):
-        print(f"❌ 找不到该文件的切片数据: {file_path}")
+    if not os.path.exists(input_file_path):
+        print(f"❌ 找不到该文件的切片数据: {input_file_path}")
         return
 
     client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
@@ -262,7 +269,7 @@ def generate_function_summaries(bugid, configPath, target_file_path):
             pass
 
     # 2. 读取 _filtered.md 中的 JSON 切片
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(input_file_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
     json_blocks = re.findall(r'```json\n(.*?)\n```', content, re.DOTALL)
@@ -274,12 +281,10 @@ def generate_function_summaries(bugid, configPath, target_file_path):
             continue
 
     if not functions_data:
-        print(f"⚠️ {orig_filename} 没有命中的函数需要分析，无法生成摘要。")
+        print(f"⚠️ {orig_filename} 没有命中的函数需要分析。")
         return
 
-    print(f"🔍 正在审视 {orig_filename} 中的 {len(functions_data)} 个执行函数...")
-
-    # 3. 组装 LLM 输入 (带上 ID，方便严格映射)
+    # 3. 组装 LLM 输入
     llm_input_funcs = []
     for i, func in enumerate(functions_data):
         llm_input_funcs.append({
@@ -290,22 +295,19 @@ def generate_function_summaries(bugid, configPath, target_file_path):
 
     llm_input_json = json.dumps(llm_input_funcs, ensure_ascii=False, indent=2)
 
-    # 4. 组装强化的提示词（增加过滤指令）
+    # 4. 提示词 (保持不变)
     system_prompt = (
         "你是一位资深的 C++ 逆向工程师与 LLVM 编译器架构专家。"
-        "你擅长通过局部代码切片，精准推推断函数的核心业务逻辑，并能一眼看穿哪些是毫无营养的死代码。"
+        "你擅长通过局部代码切片，精准推断函数的核心业务逻辑，并能一眼看穿哪些是毫无营养的死代码。"
     )
 
     user_prompt = f"""# 任务目标
     我正在进行编译器缺陷定位分析。以下是来自 LLVM 源码文件 `{orig_filename}` 中的核心执行函数切片。
     为了更好地排查 Bug，请你阅读这些代码，执行【智能降噪过滤】，并为保留下来的核心函数生成【功能摘要】。
-
     # 上下文信息
     * **文件全局功能摘要**: {file_summary}
-
     # 待分析的函数代码切片
     {llm_input_json}
-
     # 分析与提取指令（必须严格遵守）
     1. **智能过滤 (Noise Reduction)**：严格判断该函数是否为“不可能出错的微不足道的代码”。例如：
        - 纯函数声明 (Declarations without bodies)
@@ -314,7 +316,6 @@ def generate_function_summaries(bugid, configPath, target_file_path):
        - 仅包含 `assert`, `print`, `dump` 等调试代码的函数
        👉 如果属于此类，请将其 `is_trivial` 标记为 `true`。
     2. **功能提炼 (Summarization)**：如果函数包含实质的业务逻辑（`is_trivial` 为 `false`），请结合“文件全局功能”，推断这个函数扮演的具体角色，并用 1-3 句话精准总结其功能。说明它：**输入了什么条件，内部做了什么核心判断/转换，输出了什么结果**。
-
     # 输出格式要求
     请**仅输出**一个合法的 JSON 数组，必须包含传入的所有 `id`，不要输出任何额外的解释性文字。格式如下：
     [
@@ -326,10 +327,9 @@ def generate_function_summaries(bugid, configPath, target_file_path):
       {{
         "id": 1,
         "is_trivial": true,
-        "summary": "简单方法，无需摘要"
+        "summary": "无"
       }}
     ]
-
     ⚠️ 严格注意：
     1. 所有的键名必须使用双引号（"id", "is_trivial", "summary"）。
     2. 绝对不能在数组最后一个对象后添加逗号（尾随逗号）。
@@ -344,73 +344,68 @@ def generate_function_summaries(bugid, configPath, target_file_path):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
-            max_tokens=30000
+            temperature=0.1
         )
 
         reply_text = response.choices[0].message.content
-
-        # 6. 解析大模型返回的摘要与判定结果
         summary_match = re.search(r'```json\n(.*?)\n```', reply_text, re.DOTALL)
-        summary_json_str = summary_match.group(1) if summary_match else reply_text.strip().strip('`').replace('json\n',
-                                                                                                              '')
-
-        # 清理尾随逗号防止 JSON 解析崩溃
+        summary_json_str = summary_match.group(1) if summary_match else reply_text.strip()
         summary_json_str = re.sub(r',\s*([\]}])', r'\1', summary_json_str)
 
-        try:
-            summaries = json.loads(summary_json_str)
-        except json.JSONDecodeError as jde:
-            print(f"   ⚠️ JSON 解析失败，大模型返回了不规范的格式。正在跳过此文件...")
-            print(f"   [Debug] 错误的 JSON 片段: {summary_json_str[:100]}...")
-            return
+        summaries = json.loads(summary_json_str)
+        summary_dict = {item["id"]: item for item in summaries if "id" in item}
 
-        # 构建 ID 到解析结果的映射字典
-        summary_dict = {
-            item["id"]: {
-                "summary": item.get("summary", "⚠️ 摘要生成失败"),
-                "is_trivial": item.get("is_trivial", False)
-            }
-            for item in summaries if "id" in item
-        }
+        # 6. 同时构建两份 Markdown 内容
+        blocks_with_body = []
+        blocks_no_body = []
 
-        # 7. 重写 _filtered.md 文件：剔除 Trivial 函数，重构保留函数的 Markdown 排版
-        new_markdown_blocks = []
         file_discarded = 0
         file_kept = 0
 
         for i, func in enumerate(functions_data):
-            analysis_result = summary_dict.get(i, {"is_trivial": False, "summary": "⚠️ 未生成摘要"})
+            res = summary_dict.get(i, {"is_trivial": False, "summary": "⚠️ 摘要生成失败"})
 
-            # 【核心拦截逻辑】：如果是无关紧要的函数，直接抛弃！
-            if analysis_result["is_trivial"]:
+            if res.get("is_trivial", False):
                 file_discarded += 1
                 continue
 
-            # 保留函数的处理逻辑
             file_kept += 1
             sig = func.get("signature", "")
             code = func.get("source_code", "")
-            func_summary = analysis_result["summary"]
+            func_summary = res.get("summary", "")
 
-            md_block = (
+            # 格式 A: 带函数体
+            md_with_body = (
                 f"### 📍 函数签名: `{sig}`\n\n"
-                f"```cpp\n"
-                f"{code}\n"
-                f"```\n"
-                f"> **💡 功能摘要**: {func_summary}\n\n"
-                f"---\n"
+                f"```cpp\n{code}\n```\n"
+                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
             )
-            new_markdown_blocks.append(md_block)
 
-        # 覆盖原切片文件
-        with open(file_path, 'w', encoding='utf-8') as f:
-            if new_markdown_blocks:
-                f.write("\n".join(new_markdown_blocks))
-            else:
-                f.write("> **⚠️ 提示**：该文件内所有覆盖到的函数均已被 LLM 判定为无关紧要的简单代码，已被全部滤除。\n")
+            # 格式 B: 不带函数体
+            md_no_body = (
+                f"###函数签名: `{sig}`\n\n"
+                f"> **功能摘要**: {func_summary}\n\n---\n"
+            )
 
-        print(f"   ✅ 单文件提纯完成！保留核心: {file_kept} 个 | 智能剔除无用: {file_discarded} 个")
+            blocks_with_body.append(md_with_body)
+            blocks_no_body.append(md_no_body)
+
+        # 7. 写入两个文件
+        def write_file(path, blocks, title_suffix):
+            with open(path, 'w', encoding='utf-8') as f:
+                if blocks:
+                    f.write(f"# {orig_filename} - {title_suffix}\n\n")
+                    f.write("\n".join(blocks))
+                else:
+                    f.write("> **⚠️ 提示**：该文件内所有函数均已被滤除。\n")
+
+        write_file(output_path_with_body, blocks_with_body, "详细逻辑版 (含代码)")
+        write_file(output_path_no_body, blocks_no_body, "精简摘要版 (仅摘要)")
+
+        print(f"   ✅ 单文件提纯完成！")
+        print(f"      - 保存至: {os.path.basename(output_path_with_body)}")
+        print(f"      - 保存至: {os.path.basename(output_path_no_body)}")
+        print(f"      - 保留: {file_kept} | 剔除: {file_discarded}")
 
     except Exception as e:
-        print(f"   ❌ 处理文件 {orig_filename} 时发生错误: {str(e)}")
+        print(f"   ❌ 处理文件 {orig_filename} 时出错: {str(e)}")
