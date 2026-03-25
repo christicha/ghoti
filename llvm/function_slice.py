@@ -255,7 +255,7 @@ def generate_function_summaries(bugid, configPath, target_file_path):
         print(f"❌ 找不到该文件的切片数据: {input_file_path}")
         return
 
-    client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=600)
 
     # 1. 获取该文件的全局功能摘要
     file_summary = "⚠️ 暂无该文件的全局功能摘要。"
@@ -383,8 +383,8 @@ def generate_function_summaries(bugid, configPath, target_file_path):
 
             # 格式 B: 不带函数体
             md_no_body = (
-                f"###函数签名: `{sig}`\n\n"
-                f"> **功能摘要**: {func_summary}\n\n---\n"
+                f"### 📍 函数签名: `{sig}`\n\n"
+                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
             )
 
             blocks_with_body.append(md_with_body)
