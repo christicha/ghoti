@@ -38,7 +38,7 @@ def process_bugid_wrapper(args):
     compileOptionRight = compileOptionRights[i]
     compileOptionWrong = compileOptionWrongs[i]
     check = checks[i]
-    batch_generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
+    # batch_generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
     # generate_abstract_summary(bugid,configPath)
     # fileRank(bugid, configPath)

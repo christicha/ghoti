@@ -155,7 +155,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=5)
     failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=5)
 
-    client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=600)
 
     # ==========================================
     # 🌟 全局上下文架构初始化
@@ -164,7 +164,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         "你是一个资深的 LLVM 编译器优化缺陷分析专家。我们正在进行一个为期 20 轮的交互式缺陷定位任务。\n"
         "流程严格按照以下模式交替进行：\n"
         "1. 锁定文件：基于全局上下文，分析并选出一个最可疑的源文件。\n"
-        "2. 两级下钻：先提供文件函数概览，你需要指定具体函数要求查看源码，我们再提供源码供你打分。如此循环最多 11 次。\n\n"
+        "2. 两级下钻：先提供文件函数概览，你需要指定具体函数要求查看源码，我们再提供源码供你打分。如此循环最多 16 次。\n\n"
         "请严格遵守每轮的输出格式要求，不要输出任何多余的寒暄。"
     )
 
@@ -282,7 +282,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         generate_function_summaries(bugid, configPath, full_suspect_path)
 
         # ----------------------------------------
-        # 步骤 C & D 重构：11 轮函数级深度下钻
+        # 步骤 C & D 重构：16 轮函数级深度下钻
         # ----------------------------------------
         filename_only = os.path.basename(suspect_file_path)
         no_body_path = os.path.join(fileListDir_bugid, f"{filename_only}_no_body.md")
@@ -321,15 +321,15 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         round_funcs_for_this_file = []
         requested_sig = ""
 
-        print(f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最多 11 轮)...")
+        print(f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最多 16 轮)...")
 
         # ==========================================
-        # 🌀 第二层核心：11 轮内层循环 (请求签名 -> 提供代码 -> 打分)
+        # 🌀 第二层核心：16 轮内层循环 (请求签名 -> 提供代码 -> 打分)
         # ==========================================
-        for func_round_idx in range(1, 12):
+        for func_round_idx in range(1, 17):
             if func_round_idx == 1:
                 prompt_function_overview = f"""
-                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：函数概览与深度下钻 (1/11)】
+                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：函数概览与深度下钻 (1/16)】
                 我们已锁定当前可疑文件：`{suspect_file_path}`
                 该文件的整体功能摘要为：`{file_summary}`
                 
@@ -338,7 +338,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                 {functions_no_body_content}
                 ===============
                 【你的任务】
-                我们需要对该文件进行最多 11 轮的深入分析。在这一轮中，请基于之前的 Bug 根因推理以及上述函数概览，挑选出**最可疑的 1 个函数**，并要求查看其完整源码。
+                我们需要对该文件进行最多 16 轮的深入分析。在这一轮中，请基于之前的 Bug 根因推理以及上述函数概览，挑选出**最可疑的 1 个函数**，并要求查看其完整源码。
                 【输出规范】
                 请简要说明（1-2句话）你选择该函数的理由。然后，在回复的最后一行，**仅且只输出**你想要查看的完整函数签名（必须与概览中提供的签名完全一致），不要带任何反引号或额外字符。
                 """
@@ -387,7 +387,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                     requested_function_source_code = f"⚠️ 严重提示：在切片中未找到精确匹配 `{requested_sig}` 的源码。请重新检查概览，并仅输出那里存在的函数签名。如果无可疑项，请输出 [END_FILE_ANALYSIS]。"
 
                 prompt_function_drill_down = f"""
-                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：源码分析与下钻 ({func_round_idx}/11)】
+                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：源码分析与下钻 ({func_round_idx}/16)】
                 你请求查看的函数完整源码如下：
                 === 函数实现 ===
                 {requested_function_source_code}
@@ -404,7 +404,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_drill_down})
 
-                print(f"  └─ 🔬 [{func_round_idx}/11] 发送源码 `{requested_sig}` 进行审查打分...")
+                print(f"  └─ 🔬 [{func_round_idx}/16] 发送源码 `{requested_sig}` 进行审查打分...")
                 try:
                     res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages)
                     reply_text = res.choices[0].message.content or getattr(res.choices[0].message, 'reasoning_content',

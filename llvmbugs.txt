@@ -1,1 +1,1 @@
-16041,r181995,-O2,-O3,checkIsPass_zeroandsegmentoneline,install_no
+18000,r195148,-O1,-Os,checkIsPass_wrongcodeOneline,install_no
