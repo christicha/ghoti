@@ -376,15 +376,15 @@ def generate_function_summaries(bugid, configPath, target_file_path):
 
             # 格式 A: 带函数体
             md_with_body = (
-                f"###函数签名: `{sig}`\n\n"
+                f"### 📍 函数签名: `{sig}`\n\n"
                 f"```cpp\n{code}\n```\n"
-                f"> **功能摘要**: {func_summary}\n\n---\n"
+                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
             )
 
             # 格式 B: 不带函数体
             md_no_body = (
-                f"###函数签名: `{sig}`\n\n"
-                f"> **功能摘要**: {func_summary}\n\n---\n"
+                f"### 📍 函数签名: `{sig}`\n\n"
+                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
             )
 
             blocks_with_body.append(md_with_body)

@@ -155,7 +155,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=5)
     failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=5)
 
-    client = OpenAI(api_key=api_key, base_url=api_url, timeout=600)
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
 
     # ==========================================
     # 🌟 全局上下文架构初始化
