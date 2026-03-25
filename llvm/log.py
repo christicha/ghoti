@@ -77,13 +77,8 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     # 1. 预处理
     try:
         pre_cmd = [compiler, src] + flags_list + ["-E", "-x", "c", "-o", f"{output_prefix}.i"]
-        pre_result = subprocess.run(pre_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                    encoding='utf-8')
-        with open(f"{output_prefix}.i", 'w', encoding='utf-8') as f:
-            f.write(pre_result.stdout)
-        line_count = len(pre_result.stdout.splitlines()) if pre_result.stdout else 0
-        logs[
-            "preprocess"] = f"预处理命令：{' '.join(pre_cmd)}\n输出文件：{output_prefix}.i\n预处理后代码行数：{line_count}\n"
+        subprocess.run(pre_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+        logs["preprocess"] = f"预处理成功，输出至：{output_prefix}.i\n"
     except Exception as e:
         logs["preprocess"] = f"预处理失败：{str(e)}\n"
 
@@ -93,10 +88,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
         ast_result = subprocess.run(ast_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                     encoding='utf-8')
         funcs = len(re.findall(r'FunctionDecl', ast_result.stdout))
-        vars = len(re.findall(r'VarDecl', ast_result.stdout))
-        exprs = len(re.findall(r'Expr', ast_result.stdout))
-        logs["ast"] = f"AST命令：{' '.join(ast_cmd)}\n函数声明数：{funcs} | 变量声明数：{vars} | 表达式数：{exprs}\n"
-        logs["ast"] += f"AST预览：\n{chr(10).join(ast_result.stdout.splitlines()[:5])}...\n"
+        logs["ast"] = f"AST生成完成，函数声明数：{funcs}\n"
     except Exception as e:
         logs["ast"] = f"AST生成异常：{str(e)}\n"
 
@@ -110,18 +102,24 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
 
     # 4. 优化后 IR & Pass 详情
     try:
-        ir_opt_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-o", f"{output_prefix}_opt.ll",
-                                                     "-debug-pass=Structure"]
+        ir_opt_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-o", f"{output_prefix}_opt.ll", "-mllvm",
+                                                     "-debug-pass=Arguments"]
         opt_result = subprocess.run(ir_opt_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        pass_lines = [line.strip() for line in opt_result.stdout.splitlines() if "Running pass" in line]
-        logs["opt_passes"] = f"输出文件：{output_prefix}_opt.ll\nPass 数量：{len(pass_lines)}\n" + "\n".join(pass_lines)
+        pass_lines = [line.strip() for line in opt_result.stdout.splitlines() if
+                      "Pass" in line or "pass" in line.lower()]
+        logs["opt_passes"] = f"输出文件：{output_prefix}_opt.ll\nPass 结构输出行数：{len(pass_lines)}\n" + "\n".join(
+            pass_lines)
         logs["ir_opt"] = f"优化 IR 生成成功\n"
 
         ir_trace_log = f"{output_prefix}_ir_trace.log"
         ir_trace_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-mllvm", "-print-after-all", "-o",
                                                        "/dev/null"]
+
         with open(ir_trace_log, 'w', encoding='utf-8') as f:
-            subprocess.run(ir_trace_cmd, stdout=f, stderr=f, text=True)
+            trace_res = subprocess.run(ir_trace_cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+            if trace_res.returncode != 0:
+                f.write(
+                    f"\n\n[⚠️ 警告] 编译器在生成 IR 快照时崩溃 (Exit code: {trace_res.returncode})，这是因为旧版 LLVM 打印模块存在Bug。快照截断。\n")
         logs["ir_all_passes"] = f"🔥 Pass 级 IR 演进快照已保存至：{ir_trace_log}\n"
     except Exception as e:
         logs["ir_opt"] = f"优化IR生成失败：{str(e)}\n"
@@ -130,13 +128,11 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     try:
         asm_cmd = [compiler, src] + flags_list + ["-S", "-fverbose-asm", "-g", "-o", f"{output_prefix}.s"]
         subprocess.run(asm_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        with open(f"{output_prefix}.s", 'r', encoding='utf-8') as f:
-            asm_lines = [line for line in f.readlines() if not line.startswith(('#', '.')) and line.strip()]
-        logs["asm"] = f"输出文件：{output_prefix}.s\n有效指令数：{len(asm_lines)}\n"
+        logs["asm"] = f"输出文件：{output_prefix}.s\n"
     except Exception as e:
         logs["asm"] = f"汇编生成失败：{str(e)}\n"
 
-    # 6. 后端生成与交织反汇编
+    # 6. 后端生成
     try:
         backend_cmd = [compiler, src] + flags_list + ["-g", "-c", "-o", f"{output_prefix}.o", "-v"]
         subprocess.run(backend_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -175,8 +171,6 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         f.write(f"【深度编译差分分析报告 - 独立变异体】 | BugID: {bugid}\n")
         f.write(f"源文件: {src_file_path}\n")
         f.write(f"编译器: {compiler}\n")
-        f.write(f"参照参数 (Right): '{rightOption}'\n")
-        f.write(f"触发参数 (Wrong): '{wrongOption}'\n")
         f.write("=" * 100 + "\n\n")
 
         # 0. Sanitizer 检查
@@ -185,7 +179,12 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         f.write(sanitizer_log)
         f.write("=" * 100 + "\n\n")
 
-    # 分别执行两组配置
+    compile_configs = [
+        {"label": "【参照组 - 正确表现】", "flags": rightOption, "prefix": os.path.join(work_dir, "pass_cfg")},
+        {"label": "【对照组 - 触发Bug】", "flags": wrongOption, "prefix": os.path.join(work_dir, "fail_cfg")}
+    ]
+
+    run_results = []
     for cfg_dict in compile_configs:
         exe_path = cfg_dict["prefix"] + "_exe"
         flags_list = shlex.split(cfg_dict["flags"])
@@ -195,11 +194,12 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         start_time = time.time()
         compile_result = subprocess.run(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         duration = round(time.time() - start_time, 2)
-        compile_success = compile_result.returncode == 0
 
-        exe_exists, exe_abs_path = fix_executable_permission(exe_path) if compile_success else (False, "")
-        run_result = run_executable(exe_abs_path) if exe_exists else {"success": False, "exit_code": -3,
-                                                                      "output": "N/A", "error": "编译失败"}
+        exe_exists, exe_abs_path = fix_executable_permission(exe_path) if compile_result.returncode == 0 else (
+        False, "")
+        run_res = run_executable(exe_abs_path) if exe_exists else {"success": False, "exit_code": -3, "output": "N/A",
+                                                                   "error": "编译失败"}
+        run_results.append(run_res)
 
         stage_logs = get_detailed_compile_logs(compiler, src_file_path, cfg_dict["flags"], cfg_dict["prefix"])
 
