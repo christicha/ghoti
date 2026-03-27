@@ -219,15 +219,13 @@ def function_slice(bugid, configPath, target_file_path):
 
 
 # ==========================================
-# 模块 3: 单文件 LLM 提纯摘要
-# ==========================================
-# ==========================================
-# 模块 3: 单文件 LLM 提纯摘要 (修改版)
+# 模块 3: 单文件 LLM 提纯摘要 (智能分批版)
 # ==========================================
 def generate_function_summaries(bugid, configPath, target_file_path):
     """
-    单文件提纯版：读取指定文件的 AST 切片，调用 LLM 生成摘要并过滤无效函数。
+    单文件提纯版：读取指定文件的 AST 切片，调用 LLM (chat模型) 生成摘要并过滤无效函数。
     保存两份：一份带函数体 (_with_body.md)，一份不带函数体 (_no_body.md)。
+    【新增能力】：如果输入超过 Token 限制，则按阈值智能分批，最后合并字典。
     """
     cfg = ConfigParser()
     cfg.read(configPath)
@@ -255,7 +253,8 @@ def generate_function_summaries(bugid, configPath, target_file_path):
         print(f"❌ 找不到该文件的切片数据: {input_file_path}")
         return
 
-    client = OpenAI(api_key=api_key, base_url=api_url, timeout=600)
+    # 因为做了分批处理，单次请求不会太长，超时设为 120 秒即可
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=120)
 
     # 1. 获取该文件的全局功能摘要
     file_summary = "⚠️ 暂无该文件的全局功能摘要。"
@@ -284,128 +283,189 @@ def generate_function_summaries(bugid, configPath, target_file_path):
         print(f"⚠️ {orig_filename} 没有命中的函数需要分析。")
         return
 
-    # 3. 组装 LLM 输入
-    llm_input_funcs = []
+    # ==========================================
+    # 🔥 核心：智能分块批处理 (防 Token 爆炸)
+    # ==========================================
+    MAX_CHARS_PER_CHUNK = 12000  # 单批次安全阈值，约合 3000-4000 tokens
+    chunks = []
+    current_chunk = []
+    current_chars = 0
+
     for i, func in enumerate(functions_data):
-        llm_input_funcs.append({
+        sig = func.get("signature", "")
+        code = func.get("source_code", "")
+
+        # 【防爆处理】：超长函数强行截断，防止单兵撑破 Token
+        if len(code) > 10000:
+            print(f"   ⚠️ 警告：检测到超长函数 `{sig[:30]}...` ({len(code)}字符)，已执行安全截断。")
+            code = code[:9500] + "\n\n... [代码过长，为防止 Token 溢出已安全截断] ..."
+
+        func_obj = {
             "id": i,
-            "signature": func.get("signature", ""),
-            "source_code": func.get("source_code", "")
-        })
+            "signature": sig,
+            "source_code": code
+        }
 
-    llm_input_json = json.dumps(llm_input_funcs, ensure_ascii=False, indent=2)
+        func_str_len = len(json.dumps(func_obj, ensure_ascii=False))
 
-    # 4. 提示词 (保持不变)
+        # 检查是否超过单批次容量
+        if current_chars + func_str_len > MAX_CHARS_PER_CHUNK and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = [func_obj]
+            current_chars = func_str_len
+        else:
+            current_chunk.append(func_obj)
+            current_chars += func_str_len
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    print(f"🔍 共有 {len(functions_data)} 个函数，已智能切割为 {len(chunks)} 个批次并发起摘要请求。")
+
+    # 3. 循环调用 LLM 批处理，并聚合所有的结果
+    master_summary_dict = {}
+
     system_prompt = (
-        "你是一位资深的 C++ 逆向工程师与 LLVM 编译器架构专家。"
+        "你是一位资深的 C++ 逆向工程师与 LLVM 编译器架构专家。\n"
         "你擅长通过局部代码切片，精准推断函数的核心业务逻辑，并能一眼看穿哪些是毫无营养的死代码。"
     )
 
-    user_prompt = f"""# 任务目标
-    我正在进行编译器缺陷定位分析。以下是来自 LLVM 源码文件 `{orig_filename}` 中的核心执行函数切片。
-    为了更好地排查 Bug，请你阅读这些代码，执行【智能降噪过滤】，并为保留下来的核心函数生成【功能摘要】。
-    # 上下文信息
-    * **文件全局功能摘要**: {file_summary}
-    # 待分析的函数代码切片
-    {llm_input_json}
-    # 分析与提取指令（必须严格遵守）
-    1. **智能过滤 (Noise Reduction)**：严格判断该函数是否为“不可能出错的微不足道的代码”。例如：
-       - 纯函数声明 (Declarations without bodies)
-       - 极其简单的 Getter/Setter 方法
-       - 无实质逻辑的构造/析构函数
-       - 仅包含 `assert`, `print`, `dump` 等调试代码的函数
-       👉 如果属于此类，请将其 `is_trivial` 标记为 `true`。
-    2. **功能提炼 (Summarization)**：如果函数包含实质的业务逻辑（`is_trivial` 为 `false`），请结合“文件全局功能”，推断这个函数扮演的具体角色，并用 1-3 句话精准总结其功能。说明它：**输入了什么条件，内部做了什么核心判断/转换，输出了什么结果**。
-    # 输出格式要求
-    请**仅输出**一个合法的 JSON 数组，必须包含传入的所有 `id`，不要输出任何额外的解释性文字。格式如下：
-    [
-      {{
-        "id": 0,
-        "is_trivial": false,
-        "summary": "你生成的该函数功能摘要"
-      }},
-      {{
-        "id": 1,
-        "is_trivial": true,
-        "summary": "无"
-      }}
-    ]
-    ⚠️ 严格注意：
-    1. 所有的键名必须使用双引号（"id", "is_trivial", "summary"）。
-    2. 绝对不能在数组最后一个对象后添加逗号（尾随逗号）。
-    3. 如果摘要内容中包含双引号，请务必使用反斜杠转义（如 \\"）。
-    """
+    for chunk_idx, chunk_data in enumerate(chunks, 1):
+        llm_input_json = json.dumps(chunk_data, ensure_ascii=False, indent=2)
 
-    # 5. 调用大模型
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1
+        user_prompt = f"""# 任务目标
+        我正在进行编译器缺陷定位分析。以下是来自 LLVM 源码文件 `{orig_filename}` 中的核心执行函数切片（第 {chunk_idx}/{len(chunks)} 批次）。
+        为了更好地排查 Bug，请你阅读这些代码，执行【智能降噪过滤】，并为保留下来的核心函数生成【功能摘要】。
+        
+        # 上下文信息
+        * **文件全局功能摘要**: {file_summary}
+        
+        # 待分析的函数代码切片
+        {llm_input_json}
+        
+        # 分析与提取指令（必须严格遵守）
+        1. 智能过滤：严格判断该函数是否为“不可能出错的微不足道的代码”。例如：
+           - 纯函数声明(Declarations without bodies)
+           - 极其简单的Getter/Setter方法
+           - 无实质逻辑的构造/析构函数
+           - 仅包含`assert`, `print`, `dump`等调试代码的函数
+           👉 如果属于此类，请将其 `is_trivial` 标记为 `true`。
+        2. 功能提炼：如果函数包含实质的业务逻辑（`is_trivial` 为 `false`），请结合“文件全局功能”，推断这个函数扮演的具体角色，并用 1-3 句话精准总结其功能。说明它：输入了什么条件，内部做了什么核心判断/转换，输出了什么结果。
+        3. 核心调用提取：如果该函数内部调用了本项目/模块内的其他重要函数，请提取它们的名字（忽略 std:: 标准库、极简的基础 API 或宏调用），将其放入 `called_functions` 列表中。
+        
+        # 输出格式要求
+        请输出一个合法的 JSON 对象，包含一个名为 `functions` 的数组。数组中必须包含传入的所有 `id`。
+        绝对不要输出任何 markdown 代码块标记，不要输出任何额外解释，严格返回纯 JSON。
+        格式参考：
+        {{
+          "functions": [
+            {{
+              "id": 0,
+              "is_trivial": false,
+              "summary": "此函数负责检查常量折叠。如果输入指令是有效的常量树，它将执行简化操作，并返回折叠后的标量值。",
+              "called_functions": ["simplifyInstruction", "foldConstants"]
+            }},
+            {{
+              "id": 1,
+              "is_trivial": true,
+              "summary": "无",
+              "called_functions": []
+            }}
+          ]
+        }}
+        """
+        print(f"⏳ 正在请求批次 {chunk_idx}/{len(chunks)}...")
+        try:
+            # 强制使用 deepseek-chat，并启用强 JSON 结构输出
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+
+            reply_text = response.choices[0].message.content
+
+            # 清理可能的 markdown 包裹 (尽管用了 json_object，但做一层防爆处理总是好的)
+            if reply_text.startswith("```json"):
+                reply_text = reply_text.strip("```json").strip("```").strip()
+
+            summaries_obj = json.loads(reply_text)
+
+            # 安全提取 functions 列表
+            summaries_list = summaries_obj.get("functions", [])
+
+            # 汇总至 Master 字典
+            for item in summaries_list:
+                if "id" in item:
+                    master_summary_dict[item["id"]] = item
+
+        except Exception as e:
+            print(f"   ❌ 处理批次 {chunk_idx} 时出错: {str(e)}")
+            # 即使单批次出错也继续处理后续的批次，避免整个文件直接崩溃
+            continue
+
+    # 4. 根据全局 master_summary_dict 重建 Markdown 文件
+    blocks_with_body = []
+    blocks_no_body = []
+
+    file_discarded = 0
+    file_kept = 0
+
+    for i, func in enumerate(functions_data):
+        res = master_summary_dict.get(i, {"is_trivial": False, "summary": "⚠️ LLM 摘要生成失败或超时",
+                                          "called_functions": []})
+
+        if res.get("is_trivial", False):
+            file_discarded += 1
+            continue
+
+        file_kept += 1
+        sig = func.get("signature", "")
+        code = func.get("source_code", "")
+        func_summary = res.get("summary", "")
+        calls = res.get("called_functions", [])
+
+        # 格式化调用列表
+        if isinstance(calls, list) and calls:
+            calls_str = ", ".join([f"`{c}`" for c in calls])
+        else:
+            calls_str = "无"
+
+        # 格式 A: 带函数体
+        md_with_body = (
+            f"### 📍 函数签名: `{sig}`\n\n"
+            f"```cpp\n{code}\n```\n"
+            f"> **💡 功能摘要**: {func_summary}\n"
+            f"> **🔗 核心调用**: {calls_str}\n\n---\n"
         )
 
-        reply_text = response.choices[0].message.content
-        summary_match = re.search(r'```json\n(.*?)\n```', reply_text, re.DOTALL)
-        summary_json_str = summary_match.group(1) if summary_match else reply_text.strip()
-        summary_json_str = re.sub(r',\s*([\]}])', r'\1', summary_json_str)
+        # 格式 B: 不带函数体
+        md_no_body = (
+            f"### 📍 函数签名: `{sig}`\n\n"
+            f"> **💡 功能摘要**: {func_summary}\n"
+            f"> **🔗 核心调用**: {calls_str}\n\n---\n"
+        )
 
-        summaries = json.loads(summary_json_str)
-        summary_dict = {item["id"]: item for item in summaries if "id" in item}
+        blocks_with_body.append(md_with_body)
+        blocks_no_body.append(md_no_body)
 
-        # 6. 同时构建两份 Markdown 内容
-        blocks_with_body = []
-        blocks_no_body = []
+    # 5. 写入两个文件
+    def write_file(path, blocks, title_suffix):
+        with open(path, 'w', encoding='utf-8') as f:
+            if blocks:
+                f.write(f"# {orig_filename} - {title_suffix}\n\n")
+                f.write("\n".join(blocks))
+            else:
+                f.write("> **⚠️ 提示**：该文件内所有函数均已被滤除。\n")
 
-        file_discarded = 0
-        file_kept = 0
+    write_file(output_path_with_body, blocks_with_body, "详细逻辑版 (含代码)")
+    write_file(output_path_no_body, blocks_no_body, "精简摘要版 (仅摘要)")
 
-        for i, func in enumerate(functions_data):
-            res = summary_dict.get(i, {"is_trivial": False, "summary": "⚠️ 摘要生成失败"})
-
-            if res.get("is_trivial", False):
-                file_discarded += 1
-                continue
-
-            file_kept += 1
-            sig = func.get("signature", "")
-            code = func.get("source_code", "")
-            func_summary = res.get("summary", "")
-
-            # 格式 A: 带函数体
-            md_with_body = (
-                f"### 📍 函数签名: `{sig}`\n\n"
-                f"```cpp\n{code}\n```\n"
-                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
-            )
-
-            # 格式 B: 不带函数体
-            md_no_body = (
-                f"### 📍 函数签名: `{sig}`\n\n"
-                f"> **💡 功能摘要**: {func_summary}\n\n---\n"
-            )
-
-            blocks_with_body.append(md_with_body)
-            blocks_no_body.append(md_no_body)
-
-        # 7. 写入两个文件
-        def write_file(path, blocks, title_suffix):
-            with open(path, 'w', encoding='utf-8') as f:
-                if blocks:
-                    f.write(f"# {orig_filename} - {title_suffix}\n\n")
-                    f.write("\n".join(blocks))
-                else:
-                    f.write("> **⚠️ 提示**：该文件内所有函数均已被滤除。\n")
-
-        write_file(output_path_with_body, blocks_with_body, "详细逻辑版 (含代码)")
-        write_file(output_path_no_body, blocks_no_body, "精简摘要版 (仅摘要)")
-
-        print(f"   ✅ 单文件提纯完成！")
-        print(f"      - 保存至: {os.path.basename(output_path_with_body)}")
-        print(f"      - 保存至: {os.path.basename(output_path_no_body)}")
-        print(f"      - 保留: {file_kept} | 剔除: {file_discarded}")
-
-    except Exception as e:
-        print(f"   ❌ 处理文件 {orig_filename} 时出错: {str(e)}")
+    print(f"   ✅ 单文件提纯完成！")
+    print(f"      - 保存至: {os.path.basename(output_path_with_body)}")
+    print(f"      - 保存至: {os.path.basename(output_path_no_body)}")
+    print(f"      - 保留核心: {file_kept} | 剔除无用: {file_discarded}")

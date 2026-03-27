@@ -1,1 +1,2 @@
-22641,r229830,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no
+24356,r243961,-O0,-O1,checkIsPass_zeroandsegmentoneline,install_no
+24482,r245195,-O1,-Os,checkIsPass_zeroandsegmentoneline,install_no
