@@ -1,6 +1,7 @@
 from configparser import ConfigParser
 from llvm.abstract import generate_abstract_summary
 from llvm.functionFL_3 import function_FL
+from llvm.generateMutate import generateMutate
 from llvm.log import batch_generate_logs
 from llvm.rank import fileRank
 
@@ -38,16 +39,16 @@ def process_bugid_wrapper(args):
     compileOptionRight = compileOptionRights[i]
     compileOptionWrong = compileOptionWrongs[i]
     check = checks[i]
-    batch_generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
-    # generate_abstract_summary(bugid,configPath)
-    # fileRank(bugid, configPath)
+    batch_generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
+    generate_abstract_summary(bugid,configPath)
+    fileRank(bugid, configPath)
     function_FL(bugid, configPath, revision, compileOptionRight, compileOptionWrong)
 
     return bugid
 
 
-with ProcessPoolExecutor(max_workers=1) as executor:
+with ProcessPoolExecutor(max_workers=4) as executor:
     # 提交所有任务
     future_to_bugid = {
         executor.submit(process_bugid_wrapper, (
