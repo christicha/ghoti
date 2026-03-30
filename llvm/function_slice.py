@@ -297,7 +297,7 @@ def generate_function_summaries(bugid, configPath, target_file_path):
 
         # 【防爆处理】：超长函数强行截断，防止单兵撑破 Token
         if len(code) > 10000:
-            print(f"   ⚠️ 警告：检测到超长函数 `{sig[:30]}...` ({len(code)}字符)，已执行安全截断。")
+            print(f"   ⚠️ 警告：检测到超长函数 `{sig}` ({len(code)}字符)，已执行安全截断。")
             code = code[:9500] + "\n\n... [代码过长，为防止 Token 溢出已安全截断] ..."
 
         func_obj = {

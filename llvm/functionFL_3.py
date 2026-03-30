@@ -106,6 +106,22 @@ def normalize_sig(sig):
     return re.sub(r'\s+', '', sig)
 
 
+# ==========================================
+# 🌟 新增：杰卡德相似度计算工具
+# ==========================================
+def get_ngrams(s, n=2):
+    """将字符串切分为 n-gram 集合"""
+    return set([s[i:i + n] for i in range(len(s) - n + 1)]) if len(s) >= n else set(s)
+
+
+def jaccard_similarity(s1, s2):
+    """计算两个字符串的杰卡德相似度系数"""
+    set1, set2 = get_ngrams(s1), get_ngrams(s2)
+    if not set1 or not set2:
+        return 0.0
+    return len(set1.intersection(set2)) / len(set1.union(set2))
+
+
 def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong):
     cfg = ConfigParser()
     cfg.read(configPath)
@@ -223,7 +239,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     # ==========================================
     # 🌟 第一层核心：20 轮文件锁定循环
     # ==========================================
-    for file_round_idx in range(1, 10):
+    for file_round_idx in range(1, 21):
         print(f"\n==========================================")
         print(f"🔄 当前进度：文件锁定阶段 - 第 {file_round_idx} 轮 / 共 20 轮")
         print(f"==========================================")
@@ -247,12 +263,11 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             # 精简版，专门用于稍后进入函数下钻时动态替换，以节省 Token
             first_round_prompt_lite = f"""
             【初始分析基准】
-            以下是引发问题的核心背景信息（已滤除全局冗余摘要）：
+            以下是引发问题的核心背景信息：
             1. === Bug 报告 ===\n{bug_report}...
             2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
-            3. === SBFL 频谱定位结果 === \n{top_100_sbfl_str[:2500]}
-            4. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
-            5. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
+            3. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
+            4. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
             """
 
             # 【全局记忆】：完整问题（含 Top 100 摘要）进入全局记忆，用于支撑后续所有的文件挑选！
@@ -310,6 +325,35 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             print(f"❌ 无法从大模型的回复中提取到有效的文件路径！强制跳过本轮。")
             continue
 
+        # ==========================================
+        # 🌟 路径容错匹配机制 (杰卡德 + 后缀匹配)
+        # ==========================================
+        full_suspect_path_check = os.path.join(compilerDir, suspect_file_path)
+        if suspect_file_path not in top_100_files and not os.path.exists(full_suspect_path_check):
+            best_match = None
+            best_sim = 0.0
+
+            for tf in top_100_files:
+                # 1. 强力兜底：如果只是去掉了路径前缀 (如 LLM 输出了 ArgList.cpp，而真实是 Driver/ArgList.cpp)
+                if tf.endswith(suspect_file_path) or suspect_file_path.endswith(tf):
+                    best_match = tf
+                    best_sim = 1.0
+                    break
+
+                # 2. 杰卡德计算 (处理拼写错误，如 MachineCSE.c vs MachineCSE.cpp)
+                sim = jaccard_similarity(suspect_file_path, tf)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_match = tf
+
+            if best_match and best_sim > 0.3:  # 0.3 是一个避免胡乱匹配的安全阈值
+                print(f"⚠️ 路径严格匹配失败: `{suspect_file_path}`")
+                print(f"   🪄 基于相似度纠错 (Score: {best_sim:.2f})，自动重定向至: `{best_match}`")
+                suspect_file_path = best_match
+            else:
+                print(f"❌ 路径 `{suspect_file_path}` 不存在且匹配度过低 (Max Sim: {best_sim:.2f})，跳过本轮。")
+                continue
+
         analyzed_files_list.append(suspect_file_path)
         print(f"🎯 成功锁定可疑文件: {suspect_file_path}")
 
@@ -364,7 +408,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         # 🌟 新增能力：强制探索历史记忆与防逃逸机制
         explored_sigs = set()
         total_funcs_in_file = len(sig_to_code)
-        MIN_EXPLORE_ROUNDS = min(15, total_funcs_in_file)  # 保底排查 10 个函数
+        MIN_EXPLORE_ROUNDS = min(30, total_funcs_in_file)
         MAX_FUNC_ROUNDS = 30  # 最大循环扩展到 30 轮
 
         print(
@@ -471,7 +515,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
                 【你的任务】
                 1. 源码分析与打分：仔细审查上述源码，判断其内部逻辑是否导致了当前的编译优化缺陷。请为该函数分配一个可疑度分数（0-10 分，可以有小数，分数越高越可疑）。
-                2. 索要下一个函数：从之前的【函数概览】中挑选出**下一个你还没看过**的最可疑函数，要求查看其源码。
+                2. 索要下一个函数：从之前的【函数概览】中挑选出下一个你还没看过的最可疑函数，要求查看其源码。
 
                 【输出规范】
                 请严格按照以下 Markdown 表格格式输出对当前函数的打分结果（表格之后可以写简短的索要理由）：
@@ -480,6 +524,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                 | {func_round_idx} | [当前查看的函数名] | [你的打分] |
 
                 {exit_guidance}
+                最后一行仅且只输出你下一步想要查看的函数签名或结束标志，不要带任何反引号或额外字符。
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_drill_down})
 
