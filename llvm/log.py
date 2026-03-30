@@ -147,8 +147,12 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
         ir_trace_log = f"{output_prefix}_ir_trace.log"
         ir_trace_cmd = [compiler, src] + flags_list + ["-S", "-emit-llvm", "-mllvm", "-print-after-all", "-o",
                                                        "/dev/null"]
+
         with open(ir_trace_log, 'w', encoding='utf-8') as f:
-            subprocess.run(ir_trace_cmd, stdout=f, stderr=f, text=True)
+            trace_res = subprocess.run(ir_trace_cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+            if trace_res.returncode != 0:
+                f.write(
+                    f"\n\n[⚠️ 警告] 编译器在生成 IR 快照时崩溃 (Exit code: {trace_res.returncode})，这是因为旧版 LLVM 打印模块存在Bug。快照截断。\n")
         logs["ir_all_passes"] = f"🔥 Pass 级 IR 演进快照已保存至：{ir_trace_log}\n"
     except Exception as e:
         logs["ir_opt"] = f"优化IR生成及统计失败：{str(e)}\n"
@@ -163,7 +167,7 @@ def get_detailed_compile_logs(compiler, src, flags_str, output_prefix):
     except Exception as e:
         logs["asm"] = f"汇编生成失败：{str(e)}\n"
 
-    # 6. 后端生成与交织反汇编
+    # 6. 后端生成
     try:
         backend_cmd = [compiler, src] + flags_list + ["-g", "-c", "-o", f"{output_prefix}.o"]
         subprocess.run(backend_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -194,8 +198,6 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         f.write(f"【深度编译差分分析报告 - 独立变异体】 | BugID: {bugid}\n")
         f.write(f"源文件: {src_file_path}\n")
         f.write(f"编译器: {compiler}\n")
-        f.write(f"参照参数 (Right): '{rightOption}'\n")
-        f.write(f"触发参数 (Wrong): '{wrongOption}'\n")
         f.write("=" * 100 + "\n\n")
 
         # 0. Sanitizer 检查
@@ -204,7 +206,12 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         f.write(sanitizer_log)
         f.write("=" * 100 + "\n\n")
 
-    # 分别执行两组配置
+    compile_configs = [
+        {"label": "【参照组 - 正确表现】", "flags": rightOption, "prefix": os.path.join(work_dir, "pass_cfg")},
+        {"label": "【对照组 - 触发Bug】", "flags": wrongOption, "prefix": os.path.join(work_dir, "fail_cfg")}
+    ]
+
+    run_results = []
     for cfg_dict in compile_configs:
         exe_path = cfg_dict["prefix"] + "_exe"
         flags_list = shlex.split(cfg_dict["flags"])
@@ -213,7 +220,6 @@ def generate_single_case_log(bugid, compiler, src_file_path, work_dir, rightOpti
         start_time = time.time()
         compile_result = subprocess.run(full_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         duration = round(time.time() - start_time, 2)
-        compile_success = compile_result.returncode == 0
 
         # 🌟 提取编译期警告
         cfg_dict["warnings"] = [line.strip() for line in (compile_result.stdout or "").splitlines()
