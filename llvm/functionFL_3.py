@@ -9,7 +9,7 @@ from openai import OpenAI
 from llvm.function_slice import function_slice, generate_function_summaries
 
 
-def get_mutant_logs_content(mutants_log_dir, case_type, limit=5):
+def get_mutant_logs_content(mutants_log_dir, case_type, limit=10):
     """
     智能读取变异体日志：精准提取“运行结果”、“源码交织反汇编（案发现场）”与“差异对比”。
     剥离冗长的 AST 和原始 IR，确保 LLM 拥有最高质量的 Debug 上下文。
@@ -106,9 +106,6 @@ def normalize_sig(sig):
     return re.sub(r'\s+', '', sig)
 
 
-# ==========================================
-# 🌟 新增：杰卡德相似度计算工具
-# ==========================================
 def get_ngrams(s, n=2):
     """将字符串切分为 n-gram 集合"""
     return set([s[i:i + n] for i in range(len(s) - n + 1)]) if len(s) >= n else set(s)
@@ -167,12 +164,9 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     deep_compile_content = read_file_content(log_path)
 
     print("📂 正在提取并压缩变异用例的编译分析日志...")
-    passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=5)
-    failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=5)
+    passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=10)
+    failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=10)
 
-    # ==========================================
-    # 🎯 核心增强：联动处理 SBFL 与 摘要文件 (仅提取 Top 100)
-    # ==========================================
     print("🎯 正在基于 SBFL 排名截取 Top 100 嫌疑文件及摘要...")
     sbfl_result_raw = read_file_content(sbfl_result)
     abstract_content_raw = read_file_content(summary_path)
@@ -182,7 +176,6 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
     # 解析 SBFL.csv 获取 Top 100
     sbfl_lines = [line.strip() for line in sbfl_result_raw.strip().split('\n') if line.strip()]
-    # 跳过表头 "Rank,File,Score"
     start_idx = 1 if sbfl_lines and "Rank" in sbfl_lines[0] else 0
 
     for line in sbfl_lines[start_idx:start_idx + 100]:
@@ -200,10 +193,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         line = line.strip()
         if not line: continue
 
-        # 处理中文逗号和英文逗号，提取文件名部分 (如 "tools/clang/lib/Driver/ArgList.cpp")
         file_part = line.split('，')[0].strip() if '，' in line else line.split(',')[0].strip()
-
-        # 判断该行所属文件是否在 Top 100 名单中 (兼容后缀匹配防御前缀差异)
         is_match = any(file_part.endswith(tf) or tf.endswith(file_part) for tf in top_100_files)
         if is_match:
             filtered_abstracts.append(line)
@@ -214,160 +204,151 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
     print(f"   ✅ SBFL 已截取前 {len(top_100_sbfl_lines)} 名，并成功匹配出 {len(filtered_abstracts)} 份核心文件摘要。")
 
-    # 3. 初始化 LLM 客户端与系统提示词
+    # 初始化 LLM 客户端
     client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
 
-    system_prompt = (
-        "你是一个资深的 LLVM 编译器优化缺陷分析专家。我们正在进行一个为期 20 轮的交互式缺陷定位任务。\n"
-        "流程严格按照以下模式交替进行：\n"
-        "1. 锁定文件：基于全局上下文，分析并选出一个最可疑的源文件。\n"
-        "2. 两级下钻：先提供文件函数概览，你需要指定具体函数要求查看源码，我们再提供源码供你打分。如此循环最多 30 次。\n\n"
-        "请严格遵守每轮的输出格式要求，不要输出任何多余的寒暄。"
+    # ==========================================
+    # 🌟 阶段一：独立的根因分析 Agent
+    # ==========================================
+    print(f"\n🚀 [Agent 1] 开始执行全局缺陷根因推断...")
+    rc_system_prompt = (
+        "你是一个资深的 LLVM 编译器优化缺陷根因分析专家。你的任务是深度剖析编译日志、测试用例和变异体执行结果，"
+        "推断出导致 Bug 的核心逻辑和潜在出错的编译器 Pass 阶段。"
     )
 
-    # messages 将作为唯一的全局上下文，仅保存 System Prompt 和 第 1 轮的 Root Cause 问答
-    messages = [{"role": "system", "content": system_prompt}]
+    rc_user_prompt = f"""
+    请基于以下多源信息，深度分析导致该失败测试用例的编译器 Bug 根因：
+    1. === Bug 报告 ===\n{bug_report}...
+    2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}
+    3. === 编译器源文件执行次数与功能摘要 (Top 100 嫌疑文件) ===\n{top_100_abstract_str}
+    4. === SBFL 频谱定位结果 (Top 100 嫌疑榜单) === \n{top_100_sbfl_str}
+    5. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
+    6. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
 
-    analyzed_files_list = []
+    请给出一份逻辑严密的“全局缺陷根因分析报告”，不需要具体指出文件，只需指出可能出问题的优化阶段、数据结构或算法逻辑。
+    """
+
+    rc_messages = [
+        {"role": "system", "content": rc_system_prompt},
+        {"role": "user", "content": rc_user_prompt}
+    ]
+
+    root_cause_report = ""
+    try:
+        rc_response = client.chat.completions.create(model="deepseek-reasoner", messages=rc_messages)
+        rc_msg_obj = rc_response.choices[0].message
+        root_cause_report = rc_msg_obj.content or getattr(rc_msg_obj, 'reasoning_content', "")
+        print("✅ 全局根因分析报告生成完毕。")
+
+        # 💾 保存根因分析报告到 result 文件夹
+        rc_report_path = os.path.join(resultDir, 'root_cause_report.md')
+        with open(rc_report_path, 'w', encoding='utf-8') as f:
+            f.write(f"# BugID: {bugid} - 全局缺陷根因分析报告\n\n")
+            f.write(root_cause_report)
+        print(f"💾 根因分析报告已保存至: {rc_report_path}")
+
+    except Exception as e:
+        print(f"❌ 根因分析异常: {str(e)}")
+        root_cause_report = "⚠️ 根因分析生成失败，请仅基于 SBFL 榜单进行推断。"
+
+    # ==========================================
+    # 🌟 阶段二：缺陷定位 Agent - 一次性抽取 10 个可疑文件
+    # ==========================================
+    print(f"\n🚀 [Agent 2] 基于根因报告，一次性抽取 Top 10 可疑文件...")
+    loc_system_prompt = (
+        "你是一个资深的 LLVM 编译器优化缺陷定位专家。你需要基于根因分析，"
+        "从给定的嫌疑文件列表中，精准锁定最可疑的源文件集合。"
+    )
+
+    file_selection_prompt = f"""
+    【全局缺陷根因分析报告】
+    {root_cause_report}
+
+    【备选文件池】
+    === 编译器源文件执行次数与功能摘要 (Top 100 嫌疑文件) ===\n{top_100_abstract_str}
+    === SBFL 频谱定位结果 (Top 100 嫌疑榜单) === \n{top_100_sbfl_str}
+
+    【你的任务】
+    请结合上述根因分析报告，从备选文件池中挑选出最有可能包含缺陷的10个源文件，并按照嫌疑程度从高到低排序（第 1 个最可疑）。
+
+    【输出规范】
+    请在回复的最末尾，严格以如下格式输出这 10 个文件路径（必须带有后缀如 .cpp, .h），每行一个。绝对不要在文件路径前后加任何多余字符或编号。
+    === FILES START ===
+    [路径1]
+    [路径2]
+    ...
+    [路径10]
+    === FILES END ===
+    """
+
+    loc_messages = [
+        {"role": "system", "content": loc_system_prompt},
+        {"role": "user", "content": file_selection_prompt}
+    ]
+
+    extracted_10_files = []
+    try:
+        file_res = client.chat.completions.create(model="deepseek-reasoner", messages=loc_messages)
+        file_msg_obj = file_res.choices[0].message
+        file_response_text = file_msg_obj.content or getattr(file_msg_obj, 'reasoning_content', "")
+
+        # 解析抽取的 10 个文件
+        match = re.search(r'===\s*FILES START\s*=== \n(.*?)\n===\s*FILES END\s*===', file_response_text,
+                          re.DOTALL | re.IGNORECASE)
+        if match:
+            raw_files = match.group(1).split('\n')
+            extracted_10_files = [f.strip() for f in raw_files if f.strip() and ('.c' in f or '.h' in f)]
+        else:
+            # 兜底解析：用正则匹配最后出现的代码文件路径
+            paths = re.findall(r'([a-zA-Z0-9_/\-\.]+\.(?:cpp|c|h|hpp))', file_response_text)
+            extracted_10_files = list(dict.fromkeys(paths))[-10:]  # 去重取最后10个
+    except Exception as e:
+        print(f"❌ 批量抽取文件异常: {str(e)}")
+        # 兜底：直接取 SBFL 前 10
+        extracted_10_files = list(top_100_files)[:10]
+
+    if not extracted_10_files:
+        print("❌ 未能成功提取可疑文件列表，程序终止。")
+        return
+
+    print(f"🎯 成功锁定 Top 10 可疑文件:\n" + "\n".join([f"  {i + 1}. {f}" for i, f in enumerate(extracted_10_files)]))
+
     all_functions_data = []
 
-    # 提前声明精简版 Prompt，供后续下钻函数时替换使用
-    first_round_prompt_lite = ""
-
-    print(f"\n🚀 开始执行 LLVM 缺陷定位 (BugID: {bugid}) - 20 轮文件分析流程")
-
     # ==========================================
-    # 🌟 第一层核心：20 轮文件锁定循环
+    # 🌟 阶段三：循环遍历这 10 个文件进行独立下钻
     # ==========================================
-    for file_round_idx in range(1, 21):
+    for file_rank, suspect_file_path in enumerate(extracted_10_files, 1):
         print(f"\n==========================================")
-        print(f"🔄 当前进度：文件锁定阶段 - 第 {file_round_idx} 轮 / 共 20 轮")
+        print(f"🔄 当前排查进度：文件 {file_rank} / 10 -> `{suspect_file_path}`")
         print(f"==========================================")
 
-        # ----------------------------------------
-        # 步骤 A：请求模型锁定一个文件
-        # ----------------------------------------
-        if file_round_idx == 1:
-            # 完整版：注入了精准截取的 Top 100 摘要与 SBFL 分数！
-            prompt_file_full = f"""
-            【当前进度：第 1 轮 / 共 20 轮 - 阶段：锁定可疑文件】
-            请基于以下多源信息，深度分析导致该失败测试用例的编译器 Bug 根因：
-            1. === Bug 报告 ===\n{bug_report}...
-            2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}
-            3. === 编译器源文件执行次数与功能摘要 (Top 100 嫌疑文件) ===\n{top_100_abstract_str}
-            4. === SBFL 频谱定位结果 (Top 100 嫌疑榜单) === \n{top_100_sbfl_str}
-            5. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
-            6. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
-            """
-
-            # 精简版，专门用于稍后进入函数下钻时动态替换，以节省 Token
-            first_round_prompt_lite = f"""
-            【初始分析基准】
-            以下是引发问题的核心背景信息：
-            1. === Bug 报告 ===\n{bug_report}...
-            2. === 原始缺陷代码在不同优化等级下的编译日志差异 ===\n{deep_compile_content}...
-            3. === 成功变异体的编译与指令突变日志 (参考) ===\n{passing_logs_content}
-            4. === 失败变异体的编译与指令突变日志 (重点分析) ===\n{failing_logs_content}
-            """
-
-            # 【全局记忆】：完整问题（含 Top 100 摘要）进入全局记忆，用于支撑后续所有的文件挑选！
-            messages.append({"role": "user", "content": prompt_file_full})
-            print(f"🧠 正在思考并建立全局 Bug 根因推理...")
-            try:
-                response = client.chat.completions.create(
-                    model="deepseek-reasoner",
-                    messages=messages,
-                )
-                message_obj = response.choices[0].message
-                response_file = message_obj.content or getattr(message_obj, 'reasoning_content', "")
-
-                if not response_file: raise ValueError("API 返回内容为空")
-
-                # 【全局记忆】：保留大模型的第一轮回答（含根因推断）在全局记忆中
-                messages.append({"role": "assistant", "content": response_file})
-            except Exception as e:
-                print(f"❌ 锁定文件异常: {str(e)}")
-                messages.pop()  # 弹出失败的问题，避免死锁
-                continue
-
-        else:
-            prompt_file = f"""
-            【当前进度：第 {file_round_idx} 轮 / 共 20 轮 - 阶段：锁定下一个可疑文件】
-            已排查过的文件：{", ".join(analyzed_files_list)}
-            【你的任务】
-            请回顾最开始提供的全局上下文与根因推理，结合我们已经排查过的文件，重新选出第 {file_round_idx} 个最有可能存在缺陷的源文件。
-            完成推理后，在回复的最后一行，仅且只输出新锁定的文件路径，绝对不能是已经排查过的文件。
-            """
-            # 【全局记忆复用】：后续挑文件时，带上临时 Prompt。由于 messages[1] 没变，它仍然能看到所有的 Top 100 摘要！
-            temp_file_messages = messages + [{"role": "user", "content": prompt_file}]
-            print(f"🧠 基于全局根因和文件摘要，思考并锁定下一个文件...")
-            try:
-                response = client.chat.completions.create(
-                    model="deepseek-reasoner",
-                    messages=temp_file_messages,
-                )
-                response_file = response.choices[0].message.content or getattr(response.choices[0].message,
-                                                                               'reasoning_content', "")
-            except Exception as e:
-                print(f"❌ 锁定文件异常: {str(e)}")
-                continue
-
-        # 提取文件路径
-        suspect_file_path = ""
-        for line in reversed(response_file.split('\n')):
-            cleaned_line = line.replace('`', '').replace('*', '').strip()
-            match = re.search(r'([a-zA-Z0-9_/\-\.]+\.(?:cpp|c|h|hpp))', cleaned_line)
-            if match:
-                suspect_file_path = match.group(1)
-                break
-
-        if not suspect_file_path:
-            print(f"❌ 无法从大模型的回复中提取到有效的文件路径！强制跳过本轮。")
-            continue
-
-        # ==========================================
-        # 🌟 路径容错匹配机制 (杰卡德 + 后缀匹配)
-        # ==========================================
+        # --- 路径容错匹配机制 ---
         full_suspect_path_check = os.path.join(compilerDir, suspect_file_path)
         if suspect_file_path not in top_100_files and not os.path.exists(full_suspect_path_check):
             best_match = None
             best_sim = 0.0
-
             for tf in top_100_files:
-                # 1. 强力兜底：如果只是去掉了路径前缀 (如 LLM 输出了 ArgList.cpp，而真实是 Driver/ArgList.cpp)
                 if tf.endswith(suspect_file_path) or suspect_file_path.endswith(tf):
-                    best_match = tf
-                    best_sim = 1.0
+                    best_match, best_sim = tf, 1.0
                     break
-
-                # 2. 杰卡德计算 (处理拼写错误，如 MachineCSE.c vs MachineCSE.cpp)
                 sim = jaccard_similarity(suspect_file_path, tf)
                 if sim > best_sim:
-                    best_sim = sim
-                    best_match = tf
+                    best_sim, best_match = sim, tf
 
-            if best_match and best_sim > 0.3:  # 0.3 是一个避免胡乱匹配的安全阈值
-                print(f"⚠️ 路径严格匹配失败: `{suspect_file_path}`")
-                print(f"   🪄 基于相似度纠错 (Score: {best_sim:.2f})，自动重定向至: `{best_match}`")
+            if best_match and best_sim > 0.3:
+                print(f"⚠️ 自动重定向文件路径: `{suspect_file_path}` -> `{best_match}` (Sim: {best_sim:.2f})")
                 suspect_file_path = best_match
             else:
-                print(f"❌ 路径 `{suspect_file_path}` 不存在且匹配度过低 (Max Sim: {best_sim:.2f})，跳过本轮。")
+                print(f"❌ 路径 `{suspect_file_path}` 不存在，跳过。")
                 continue
 
-        analyzed_files_list.append(suspect_file_path)
-        print(f"🎯 成功锁定可疑文件: {suspect_file_path}")
-
-        # ----------------------------------------
-        # 步骤 B：执行 AST 切割与两份 LLM 切片生成
-        # ----------------------------------------
+        # --- AST 切片 ---
         full_suspect_path = os.path.join(compilerDir, suspect_file_path)
-        print("🔪 正在执行 AST 切片与摘要提纯 (生成无代码与带代码双版本)...")
+        print("🔪 正在执行 AST 切片与摘要提纯...")
         function_slice(bugid, configPath, full_suspect_path)
         generate_function_summaries(bugid, configPath, full_suspect_path)
 
-        # ----------------------------------------
-        # 步骤 C & D 重构：30 轮函数级深度下钻
-        # ----------------------------------------
         filename_only = os.path.basename(suspect_file_path)
         no_body_path = os.path.join(fileListDir_bugid, f"{filename_only}_no_body.md")
         with_body_path = os.path.join(fileListDir_bugid, f"{filename_only}_with_body.md")
@@ -385,155 +366,139 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         functions_with_body_content = read_file_content(with_body_path)
 
         if not functions_no_body_content or "⚠️" in functions_no_body_content:
-            print(f"⏭️ 该文件 {filename_only} 无有效函数切片或已全过滤，跳入下一轮文件。")
+            print(f"⏭️ 文件 {filename_only} 无有效切片，跳过。")
             continue
 
-        # 建立签名到源码的快速查询字典
         sig_to_code = {}
         matches = re.finditer(r'### 📍 函数签名: `(.*?)`\n\n```cpp\n(.*?)\n```', functions_with_body_content, re.DOTALL)
         for m in matches:
             sig_to_code[m.group(1).strip()] = m.group(2).strip()
 
-        # 【局部记忆核心：按需卸载冗余 Token】
-        drill_messages = []
-        for i, msg in enumerate(messages):
-            if i == 1 and msg["role"] == "user":
-                drill_messages.append({"role": "user", "content": first_round_prompt_lite})
-            else:
-                drill_messages.append(msg.copy())
+        # 🎯 为当前文件初始化局部交互上下文
+        drill_system_prompt = (
+            "你是一个资深的 LLVM 编译器缺陷下钻专家。我们将为一个可疑文件进行最多 30 轮的函数代码审查。\n"
+            "你会基于已知的根因分析上下文，挑选函数索要源码，并进行 0-10 分的打分。\n"
+            "请严格按照表格格式输出打分，并仅输出下一步要求的函数签名。"
+        )
+        drill_messages = [{"role": "system", "content": drill_system_prompt}]
+
+        # 传递根因上下文
+        context_prompt = f"""
+        【全局根因分析指导】
+        {root_cause_report}
+
+        当前正在深度排查的第 {file_rank} 可疑文件是：`{suspect_file_path}`
+        该文件的核心功能摘要为：`{file_summary}`
+        """
+        drill_messages.append({"role": "user", "content": context_prompt})
+        drill_messages.append({"role": "assistant",
+                               "content": "收到，我已经理解了 Bug 的根因逻辑及当前文件的基本功能。请提供该文件的函数概览，我将开始挑选可疑函数。"})
 
         round_funcs_for_this_file = []
         requested_sig = ""
-
-        # 🌟 新增能力：强制探索历史记忆与防逃逸机制
         explored_sigs = set()
         total_funcs_in_file = len(sig_to_code)
         MIN_EXPLORE_ROUNDS = min(30, total_funcs_in_file)
-        MAX_FUNC_ROUNDS = 30  # 最大循环扩展到 30 轮
+        MAX_FUNC_ROUNDS = 30
 
-        print(
-            f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最多 {MAX_FUNC_ROUNDS} 轮, 保底 {MIN_EXPLORE_ROUNDS} 轮)...")
+        print(f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最多 {MAX_FUNC_ROUNDS} 轮)...")
 
-        # ==========================================
-        # 🌀 第二层核心：30 轮内层循环 (请求签名 -> 提供代码 -> 打分)
-        # ==========================================
+        # --- 函数 30 轮循环下钻 ---
         for func_round_idx in range(1, MAX_FUNC_ROUNDS + 1):
             if func_round_idx == 1:
                 prompt_function_overview = f"""
-                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：函数概览与深度下钻 (1/{MAX_FUNC_ROUNDS})】
-                我们已锁定当前可疑文件：`{suspect_file_path}`
-                该文件的整体功能摘要为：`{file_summary}`
-
+                【当前阶段：函数概览与深度下钻 (1/{MAX_FUNC_ROUNDS})】
                 以下是该文件在处理失败测试用例时实际执行过的函数概览（仅包含函数签名和功能摘要）：
                 === 函数概览 ===
                 {functions_no_body_content}
                 ===============
+
                 【你的任务】
-                你需要对该文件进行最多 {MAX_FUNC_ROUNDS} 轮的深入分析。目前是第 1 轮。
-                请基于之前的 Bug 根因推理以及上述函数概览，挑选出最可疑的 1 个函数，并要求查看其完整源码。
+                请基于你掌握的全局根因，挑选出最可疑的 1 个函数，并要求查看其完整源码。
                 【输出规范】
-                请简要说明（1-2句话）你选择该函数的理由。然后在回复的最后一行，仅且只输出你想要查看的完整函数签名（必须与概览中提供的签名完全一致），不要带任何反引号或额外字符。
-                ⚠️ 注意：当前尚未排查任何函数，你**绝对不能**提前结束分析。
+                简要说明理由。然后在最后一行，仅且只输出想要查看的完整函数签名（不带反引号）。
+                ⚠️ 注意：这是第一轮，绝对不能提前结束分析。
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_overview})
 
-                print(f"  └─ 🕵️‍♂️ [R-1] 正在请求函数概览并挑选首个嫌疑函数...")
+                print(f"  └─ 🕵️‍♂️ [R-1] 正在请求挑选首个嫌疑函数...")
                 try:
                     res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages)
                     reply_text = res.choices[0].message.content or getattr(res.choices[0].message, 'reasoning_content',
                                                                            "")
-
                     drill_messages.append({"role": "assistant", "content": reply_text})
-
                     lines = [l.strip() for l in reply_text.split('\n') if l.strip()]
                     requested_sig = lines[-1].replace('`', '')
                 except Exception as e:
-                    print(f"  ❌ 第一轮索要签名异常: {e}")
+                    print(f"  ❌ 索要签名异常: {e}")
                     break
 
             else:
-                # 🛑 强制防逃逸拦截机制
+                # 🛑 防逃逸拦截
                 if "[END_FILE_ANALYSIS]" in requested_sig:
                     if func_round_idx <= MIN_EXPLORE_ROUNDS:
-                        print(
-                            f"  ⚠️ 拦截：大模型试图在第 {func_round_idx} 轮提前退出！(保底要求 {MIN_EXPLORE_ROUNDS} 轮)")
-                        # 自动代投：从还没看过的函数里挑一个
+                        print(f"  ⚠️ 拦截：大模型试图提前退出！(保底要求 {MIN_EXPLORE_ROUNDS} 轮)")
                         unexplored = [s for s in sig_to_code.keys() if normalize_sig(s) not in explored_sigs]
                         if unexplored:
-                            requested_sig = unexplored[0]  # 或用 random.choice(unexplored)
-                            print(f"  └─ 🤖 脚本强行代投下一个未排查函数: `{requested_sig[:50]}...`")
+                            requested_sig = unexplored[0]
+                            print(f"  └─ 🤖 脚本强行代投下一个未排查函数...")
                         else:
-                            print(f"  ✅ 该文件实际函数仅有 {total_funcs_in_file} 个，已全部看完，正常结束下钻。")
                             break
                     else:
-                        print(f"  ✅ 模型判定该文件 {filename_only} 排查完毕，提前结束下钻。")
+                        print(f"  ✅ 模型判定该文件排查完毕，正常结束下钻。")
                         break
 
-                # 记录这轮访问过的签名
                 explored_sigs.add(normalize_sig(requested_sig))
-
-                # 1. 尝试精确匹配
                 requested_function_source_code = sig_to_code.get(requested_sig)
 
-                # 2. 模糊匹配兜底 (完美防空格/不可见字符幻觉版)
+                # 模糊匹配兜底
                 if not requested_function_source_code:
                     norm_req_sig = normalize_sig(requested_sig)
-
                     for s, c in sig_to_code.items():
                         norm_s = normalize_sig(s)
-                        if requested_sig in s or s in requested_sig:
-                            requested_function_source_code = c
-                            requested_sig = s
-                            break
-                        elif norm_req_sig in norm_s or norm_s in norm_req_sig:
-                            requested_function_source_code = c
-                            requested_sig = s
+                        if requested_sig in s or s in requested_sig or norm_req_sig in norm_s or norm_s in norm_req_sig:
+                            requested_function_source_code, requested_sig = c, s
                             break
 
                 if not requested_function_source_code:
-                    requested_function_source_code = f"⚠️ 严重提示：在切片中未找到精确匹配 `{requested_sig}` 的源码。请重新检查概览，并仅输出那里存在的函数签名。如果无可疑项，请输出 [END_FILE_ANALYSIS]。"
+                    requested_function_source_code = f"⚠️ 严重提示：未找到匹配 `{requested_sig}` 的源码。请重新检查概览，如果无可疑项，请输出 [END_FILE_ANALYSIS]。"
 
-                # 📝 构建历史记忆清单
                 explored_list_str = "\n".join([f"- {s}" for s in list(explored_sigs)]) if explored_sigs else "无"
 
-                # 🛡️ 动态指导语：前期严禁退出，后期开放自由
-                if func_round_idx < MIN_EXPLORE_ROUNDS:
-                    exit_guidance = f"⚠️ 强制要求：当前是第 {func_round_idx} 轮（保底需排查 {MIN_EXPLORE_ROUNDS} 个函数）。你必须在最后一行输出**下一个未排查**的函数签名，**绝对不能**输出结束标志。"
-                else:
-                    exit_guidance = "如果你结合打分，认为该文件内没有其他可能引发 Bug 的可疑函数了，可以结束排查，请在最后一行仅输出关键字：`[END_FILE_ANALYSIS]`。"
+                exit_guidance = (
+                    f"⚠️ 强制要求：必须排查至少 {MIN_EXPLORE_ROUNDS} 个函数，禁止结束。"
+                    if func_round_idx < MIN_EXPLORE_ROUNDS else
+                    "如果没有其他可疑函数，请在最后一行输出：`[END_FILE_ANALYSIS]`。"
+                )
 
                 prompt_function_drill_down = f"""
-                【当前进度：第 {file_round_idx} 轮文件排查 - 阶段：源码分析与下钻 ({func_round_idx}/{MAX_FUNC_ROUNDS})】
-                你请求查看的函数完整源码如下：
+                【当前阶段：源码分析与下钻 ({func_round_idx}/{MAX_FUNC_ROUNDS})】
+                请求的函数完整源码如下：
                 === 函数实现 ===
                 {requested_function_source_code}
                 ===============
 
-                【历史排查记忆】
-                你已经审查过了以下函数，请从剩下的概览中挑选：
-                {explored_list_str}
+                已排查过的历史函数：\n{explored_list_str}
 
                 【你的任务】
-                1. 源码分析与打分：仔细审查上述源码，判断其内部逻辑是否导致了当前的编译优化缺陷。请为该函数分配一个可疑度分数（0-10 分，可以有小数，分数越高越可疑）。
-                2. 索要下一个函数：从之前的【函数概览】中挑选出下一个你还没看过的最可疑函数，要求查看其源码。
+                1. 为该函数打分 (0-10分，基于之前的根因分析)。
+                2. 从概览中挑选下一个没看过的函数。
 
                 【输出规范】
-                请严格按照以下 Markdown 表格格式输出对当前函数的打分结果（表格之后可以写简短的索要理由）：
                 | Rank (当前下钻轮次) | Function Name | Score |
                 |---|---|---|
                 | {func_round_idx} | [当前查看的函数名] | [你的打分] |
 
                 {exit_guidance}
-                最后一行仅且只输出你下一步想要查看的函数签名或结束标志，不要带任何反引号或额外字符。
+                最后一行仅且只输出下一步想要查看的函数签名或结束标志，不要带额外字符。
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_drill_down})
 
-                print(f"  └─ 🔬 [{func_round_idx}/{MAX_FUNC_ROUNDS}] 发送源码 `{requested_sig}` 进行审查打分...")
+                print(f"  └─ 🔬 [{func_round_idx}/{MAX_FUNC_ROUNDS}] 审查源码 `{requested_sig}` 并打分...")
                 try:
                     res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages)
                     reply_text = res.choices[0].message.content or getattr(res.choices[0].message, 'reasoning_content',
                                                                            "")
-
                     drill_messages.append({"role": "assistant", "content": reply_text})
 
                     extracted_tables = extract_table_from_llm_response(reply_text)
@@ -543,59 +508,77 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
 
                     lines = [l.strip() for l in reply_text.split('\n') if l.strip()]
                     requested_sig = lines[-1].replace('`', '')
-
                 except Exception as e:
-                    print(f"  ❌ 源码审查轮次异常: {e}")
+                    print(f"  ❌ 源码审查异常: {e}")
                     break
 
-        # ----------- 单文件排查结束，保存该文件的函数分数 -----------
+        # --- 单文件下钻结束，保存并聚合数据 ---
         if round_funcs_for_this_file:
-            single_round_md_path = os.path.join(resultDir, f"round_{file_round_idx}_{filename_only}_rank.md")
+            single_round_md_path = os.path.join(resultDir, f"rank_{file_rank}_{filename_only}_funcs.md")
             with open(single_round_md_path, 'w', encoding='utf-8') as srf:
-                srf.write(f"# 第 {file_round_idx} 轮文件函数排名 - `{filename_only}`\n\n")
-                srf.write("| 探测顺序 | Function Name | Score |\n")
-                srf.write("|---|---|---|\n")
+                srf.write(f"# Top {file_rank} 嫌疑文件函数排名 - `{filename_only}`\n\n")
+                srf.write("| 探测顺序 | Function Name | Score |\n|---|---|---|\n")
                 for idx, func in enumerate(round_funcs_for_this_file, 1):
                     srf.write(f"| {idx} | `{func['func_name']}` | {func['llm_score']} |\n")
 
             for func in round_funcs_for_this_file:
-                func['file_rank'] = file_round_idx
+                func['file_rank'] = file_rank
                 func['file_name'] = suspect_file_path
                 all_functions_data.append(func)
 
-            print(
-                f"💾 第 {file_round_idx} 轮单文件 ({len(round_funcs_for_this_file)} 个函数) 排行已独立保存: {single_round_md_path}")
+            print(f"💾 Top {file_rank} 嫌疑文件排查完毕，排名独立保存: {single_round_md_path}")
         else:
-            print(f"⚠️ 第 {file_round_idx} 轮未提取到任何函数打分。")
+            print(f"⚠️ Top {file_rank} 文件未提取到有效打分。")
 
     # ==========================================
-    # 🏁 终极汇总与指数衰减重新排版
+    # 🏁 终极汇总与重排版 (双重榜单对比输出)
     # ==========================================
     if not all_functions_data:
-        print("\n❌ 严重警告：20 轮排查未能提取到任何有效的函数打分。")
+        print("\n❌ 严重警告：全局排查未能提取到任何有效的函数打分。")
         return
 
-    print("\n📈 正在进行全局综合分数计算 (指数衰减策略)...")
+    print("\n📈 正在进行全局综合分数计算及双榜单生成...")
     gamma = 0.85
-
     for item in all_functions_data:
-        file_rank = item['file_rank']
-        llm_score = item['llm_score']
-        item['final_score'] = round(llm_score * (gamma ** (file_rank - 1)), 4)
+        # file_rank 越小越排前，衰减计算不变
+        item['final_score'] = round(item['llm_score'] * (gamma ** (item['file_rank'] - 1)), 4)
 
-    all_functions_data.sort(key=lambda x: x['final_score'], reverse=True)
+    # ------------------------------------------
+    # 榜单 1：基于指数衰减策略排序 (综合考虑了文件级优先级)
+    # ------------------------------------------
+    decay_sorted_data = sorted(all_functions_data, key=lambda x: x['final_score'], reverse=True)
 
-    final_ranked_md_path = os.path.join(resultDir, 'ultimate_function_rank.md')
-    md_content = f"# 🎯 BugID: {bugid} - 全局函数级缺陷定位最终排行\n\n"
-    md_content += f"> **参数说明**: 基础衰减因子 Gamma = {gamma} \n"
-    md_content += f"> **计算公式**: Final_Score = LLM_Score * (Gamma ^ (File_Rank - 1))\n\n"
-    md_content += "| 全局排名 | 综合得分 | 所在文件 (Rank) | 函数名称 | 原始 LLM 评分 |\n"
-    md_content += "|:---:|:---:|---|---|:---:|\n"
+    decay_ranked_md_path = os.path.join(resultDir, 'ultimate_function_rank_decay.md')
+    decay_md_content = f"# 🎯 BugID: {bugid} - 全局函数缺陷定位 (指数衰减策略)\n\n"
+    decay_md_content += f"> **参数说明**: 基础衰减因子 Gamma = {gamma} \n"
+    decay_md_content += f"> **计算公式**: Final_Score = LLM_Score * (Gamma ^ (File_Rank - 1))\n\n"
+    decay_md_content += "| 全局排名 | 综合得分 | 所在文件 (Rank) | 函数名称 | 原始 LLM 评分 |\n"
+    decay_md_content += "|:---:|:---:|---|---|:---:|\n"
 
-    for idx, item in enumerate(all_functions_data, 1):
-        md_content += f"| {idx} | **{item['final_score']}** | {os.path.basename(item['file_name'])} (R{item['file_rank']}) | `{item['func_name']}` | {item['llm_score']} |\n"
+    for idx, item in enumerate(decay_sorted_data, 1):
+        decay_md_content += f"| {idx} | **{item['final_score']}** | {os.path.basename(item['file_name'])} (R{item['file_rank']}) | `{item['func_name']}` | {item['llm_score']} |\n"
 
-    with open(final_ranked_md_path, 'w', encoding='utf-8') as f:
-        f.write(md_content)
+    with open(decay_ranked_md_path, 'w', encoding='utf-8') as f:
+        f.write(decay_md_content)
 
-    print(f"🎉 全部分析排查完成！终极全局排行已保存至: {final_ranked_md_path}")
+    # ------------------------------------------
+    # 榜单 2：仅基于纯函数可疑度排序 (剥离文件影响)
+    # ------------------------------------------
+    # 二级排序规则：首选 llm_score 降序；若分数相同，则按照 file_rank 升序 (来自越高排名文件的排越前)
+    raw_sorted_data = sorted(all_functions_data, key=lambda x: (x['llm_score'], -x['file_rank']), reverse=True)
+
+    raw_ranked_md_path = os.path.join(resultDir, 'ultimate_function_rank_raw.md')
+    raw_md_content = f"# 🎯 BugID: {bugid} - 全局函数缺陷定位 (纯函数可疑度排行)\n\n"
+    raw_md_content += f"> **说明**: 仅根据 LLM 对函数的直接打分 (0-10) 进行排序。当函数分数相同时，原文件排名更靠前的函数优先。\n\n"
+    raw_md_content += "| 全局排名 | 原始 LLM 评分 | 所在文件 (Rank) | 函数名称 | 综合得分 (参考) |\n"
+    raw_md_content += "|:---:|:---:|---|---|:---:|\n"
+
+    for idx, item in enumerate(raw_sorted_data, 1):
+        raw_md_content += f"| {idx} | **{item['llm_score']}** | {os.path.basename(item['file_name'])} (R{item['file_rank']}) | `{item['func_name']}` | {item['final_score']} |\n"
+
+    with open(raw_ranked_md_path, 'w', encoding='utf-8') as f:
+        f.write(raw_md_content)
+
+    print(f"🎉 全部分析排查完成！已生成双重对比榜单：")
+    print(f"  📂 1. 指数衰减排行: {decay_ranked_md_path}")
+    print(f"  📂 2. 纯函数打分排行: {raw_ranked_md_path}")

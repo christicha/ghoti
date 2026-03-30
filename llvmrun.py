@@ -39,7 +39,7 @@ def process_bugid_wrapper(args):
     compileOptionRight = compileOptionRights[i]
     compileOptionWrong = compileOptionWrongs[i]
     check = checks[i]
-    generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
+    # generateMutate(bugid, revision, check, compileOptionRight, compileOptionWrong, configPath)
     batch_generate_logs(bugid, revision, configPath, compileOptionRight, compileOptionWrong)
     generate_abstract_summary(bugid,configPath)
     fileRank(bugid, configPath)
@@ -48,7 +48,7 @@ def process_bugid_wrapper(args):
     return bugid
 
 
-with ProcessPoolExecutor(max_workers=3) as executor:
+with ProcessPoolExecutor(max_workers=4) as executor:
     # 提交所有任务
     future_to_bugid = {
         executor.submit(process_bugid_wrapper, (
