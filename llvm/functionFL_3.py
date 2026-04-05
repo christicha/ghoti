@@ -134,8 +134,8 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     api_url = cfg.get('deepseek', 'url')
 
     # 定义各个文件的绝对路径
-    bug_report_path = os.path.join(baseLogDir, bugid, 'bug_report.txt')
-    log_path = os.path.join('/home/chris/ghoti/benchmark/llvmbugs', bugid, 'version')
+    bug_report_path = os.path.join('/home/chris/ghoti/benchmark/llvmbugs', bugid, 'version')
+    log_path = os.path.join(baseLogDir, bugid, 'compile.log')
     sbfl_result = os.path.join(baseLogDir, bugid, 'SBFL.csv')
     summary_path = os.path.join(baseLogDir, bugid, 'abstract_summary.txt')
     compilerDir = os.path.join(baseCompilerDir, rev, rev, 'llvm')
@@ -164,8 +164,8 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     deep_compile_content = read_file_content(log_path)
 
     print("📂 正在提取并压缩变异用例的编译分析日志...")
-    passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=10)
-    failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=10)
+    passing_logs_content = get_mutant_logs_content(mutants_log_dir, "pass", limit=5)
+    failing_logs_content = get_mutant_logs_content(mutants_log_dir, "fail", limit=5)
 
     print("🎯 正在基于 SBFL 排名截取 Top 100 嫌疑文件及摘要...")
     sbfl_result_raw = read_file_content(sbfl_result)
@@ -205,10 +205,10 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     print(f"   ✅ SBFL 已截取前 {len(top_100_sbfl_lines)} 名，并成功匹配出 {len(filtered_abstracts)} 份核心文件摘要。")
 
     # 初始化 LLM 客户端
-    client = OpenAI(api_key=api_key, base_url=api_url, timeout=3600)
+    client = OpenAI(api_key=api_key, base_url=api_url, timeout=360)
 
     # ==========================================
-    # 🌟 阶段一：独立的根因分析 Agent
+    # 🌟 阶段一：独立的根因分析 Agent (加入流式)
     # ==========================================
     print(f"\n🚀 [Agent 1] 开始执行全局缺陷根因推断...")
     rc_system_prompt = (
@@ -234,11 +234,32 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     ]
 
     root_cause_report = ""
+    root_cause_reasoning = ""
     try:
-        rc_response = client.chat.completions.create(model="deepseek-reasoner", messages=rc_messages)
-        rc_msg_obj = rc_response.choices[0].message
-        root_cause_report = rc_msg_obj.content or getattr(rc_msg_obj, 'reasoning_content', "")
-        print("✅ 全局根因分析报告生成完毕。")
+        print("  └─ 🧠 正在思考根因: \n", end="", flush=True)
+        rc_response = client.chat.completions.create(model="deepseek-reasoner", messages=rc_messages, stream=True)
+
+        has_printed_content = False
+        for chunk in rc_response:
+            delta = chunk.choices[0].delta
+            # 捕获思考过程
+            r_text = getattr(delta, 'reasoning_content', None)
+            if r_text:
+                root_cause_reasoning += r_text
+                print(r_text, end="", flush=True)
+
+            # 捕获最终输出
+            c_text = getattr(delta, 'content', None)
+            if c_text:
+                if not has_printed_content:
+                    print("\n\n  └─ 📝 最终报告: \n", end="", flush=True)
+                    has_printed_content = True
+                root_cause_report += c_text
+                print(c_text, end="", flush=True)
+
+        print("\n✅ 全局根因分析报告生成完毕。")
+        # 兜底：如果最终报告为空，取思考过程
+        root_cause_report = root_cause_report if root_cause_report.strip() else root_cause_reasoning
 
         # 💾 保存根因分析报告到 result 文件夹
         rc_report_path = os.path.join(resultDir, 'root_cause_report.md')
@@ -248,11 +269,11 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         print(f"💾 根因分析报告已保存至: {rc_report_path}")
 
     except Exception as e:
-        print(f"❌ 根因分析异常: {str(e)}")
+        print(f"\n❌ 根因分析异常: {str(e)}")
         root_cause_report = "⚠️ 根因分析生成失败，请仅基于 SBFL 榜单进行推断。"
 
     # ==========================================
-    # 🌟 阶段二：缺陷定位 Agent - 一次性抽取 10 个可疑文件
+    # 🌟 阶段二：缺陷定位 Agent - 一次性抽取 10 个可疑文件 (加入流式)
     # ==========================================
     print(f"\n🚀 [Agent 2] 基于根因报告，一次性抽取 Top 10 可疑文件...")
     loc_system_prompt = (
@@ -287,10 +308,30 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
     ]
 
     extracted_10_files = []
+    file_response_text = ""
+    file_reasoning_text = ""
     try:
-        file_res = client.chat.completions.create(model="deepseek-reasoner", messages=loc_messages)
-        file_msg_obj = file_res.choices[0].message
-        file_response_text = file_msg_obj.content or getattr(file_msg_obj, 'reasoning_content', "")
+        print("  └─ 🧠 正在筛选文件: \n", end="", flush=True)
+        file_res = client.chat.completions.create(model="deepseek-reasoner", messages=loc_messages, stream=True)
+
+        has_printed_content = False
+        for chunk in file_res:
+            delta = chunk.choices[0].delta
+            r_text = getattr(delta, 'reasoning_content', None)
+            if r_text:
+                file_reasoning_text += r_text
+                # print(r_text, end="", flush=True)
+
+            c_text = getattr(delta, 'content', None)
+            if c_text:
+                if not has_printed_content:
+                    print("\n\n  └─ 📝 提取结果: \n", end="", flush=True)
+                    has_printed_content = True
+                file_response_text += c_text
+                # print(c_text, end="", flush=True)
+
+        print("\n")
+        file_response_text = file_response_text if file_response_text.strip() else file_reasoning_text
 
         # 解析抽取的 10 个文件
         match = re.search(r'===\s*FILES START\s*=== \n(.*?)\n===\s*FILES END\s*===', file_response_text,
@@ -303,7 +344,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
             paths = re.findall(r'([a-zA-Z0-9_/\-\.]+\.(?:cpp|c|h|hpp))', file_response_text)
             extracted_10_files = list(dict.fromkeys(paths))[-10:]  # 去重取最后10个
     except Exception as e:
-        print(f"❌ 批量抽取文件异常: {str(e)}")
+        print(f"\n❌ 批量抽取文件异常: {str(e)}")
         # 兜底：直接取 SBFL 前 10
         extracted_10_files = list(top_100_files)[:10]
 
@@ -401,7 +442,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
         MIN_EXPLORE_ROUNDS = min(30, total_funcs_in_file)
         MAX_FUNC_ROUNDS = 30
 
-        print(f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最多 {MAX_FUNC_ROUNDS} 轮)...")
+        print(f"\n🔍 开启文件 {filename_only} 的内部函数下钻排查 (最少 {MIN_EXPLORE_ROUNDS} 轮)...")
 
         # --- 函数 30 轮循环下钻 ---
         for func_round_idx in range(1, MAX_FUNC_ROUNDS + 1):
@@ -421,16 +462,37 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_overview})
 
-                print(f"  └─ 🕵️‍♂️ [R-1] 正在请求挑选首个嫌疑函数...")
+                print(f"  └─ 🕵️‍♂️ [R-1] 正在请求挑选首个嫌疑函数...\n  思考过程: \n", end="", flush=True)
                 try:
-                    res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages)
-                    reply_text = res.choices[0].message.content or getattr(res.choices[0].message, 'reasoning_content',
-                                                                           "")
+                    res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages,
+                                                         stream=True)
+                    reply_text = ""
+                    reasoning_text = ""
+                    has_printed_content = False
+
+                    for chunk in res:
+                        delta = chunk.choices[0].delta
+                        r_text = getattr(delta, 'reasoning_content', None)
+                        if r_text:
+                            reasoning_text += r_text
+                            # print(r_text, end="", flush=True)
+
+                        c_text = getattr(delta, 'content', None)
+                        if c_text:
+                            if not has_printed_content:
+                                print("\n\n  最终输出: \n", end="", flush=True)
+                                has_printed_content = True
+                            reply_text += c_text
+                            # print(c_text, end="", flush=True)
+
+                    print("\n")
+                    reply_text = reply_text if reply_text.strip() else reasoning_text
+
                     drill_messages.append({"role": "assistant", "content": reply_text})
                     lines = [l.strip() for l in reply_text.split('\n') if l.strip()]
                     requested_sig = lines[-1].replace('`', '')
                 except Exception as e:
-                    print(f"  ❌ 索要签名异常: {e}")
+                    print(f"\n  ❌ 索要签名异常: {e}")
                     break
 
             else:
@@ -494,11 +556,34 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                 """
                 drill_messages.append({"role": "user", "content": prompt_function_drill_down})
 
-                print(f"  └─ 🔬 [{func_round_idx}/{MAX_FUNC_ROUNDS}] 审查源码 `{requested_sig}` 并打分...")
+                print(
+                    f"  └─ 🔬 [{func_round_idx}/{MAX_FUNC_ROUNDS}] 审查源码 `{requested_sig}` 并打分...\n  思考过程: \n",
+                    end="", flush=True)
                 try:
-                    res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages)
-                    reply_text = res.choices[0].message.content or getattr(res.choices[0].message, 'reasoning_content',
-                                                                           "")
+                    res = client.chat.completions.create(model="deepseek-reasoner", messages=drill_messages,
+                                                         stream=True)
+                    reply_text = ""
+                    reasoning_text = ""
+                    has_printed_content = False
+
+                    for chunk in res:
+                        delta = chunk.choices[0].delta
+                        r_text = getattr(delta, 'reasoning_content', None)
+                        if r_text:
+                            reasoning_text += r_text
+                            # print(r_text, end="", flush=True)
+
+                        c_text = getattr(delta, 'content', None)
+                        if c_text:
+                            if not has_printed_content:
+                                print("\n\n  最终输出: \n", end="", flush=True)
+                                has_printed_content = True
+                            reply_text += c_text
+                            # print(c_text, end="", flush=True)
+
+                    print("\n")
+                    reply_text = reply_text if reply_text.strip() else reasoning_text
+
                     drill_messages.append({"role": "assistant", "content": reply_text})
 
                     extracted_tables = extract_table_from_llm_response(reply_text)
@@ -509,7 +594,7 @@ def function_FL(bugid, configPath, rev, compilerOptionRight, compilerOptionWrong
                     lines = [l.strip() for l in reply_text.split('\n') if l.strip()]
                     requested_sig = lines[-1].replace('`', '')
                 except Exception as e:
-                    print(f"  ❌ 源码审查异常: {e}")
+                    print(f"\n  ❌ 源码审查异常: {e}")
                     break
 
         # --- 单文件下钻结束，保存并聚合数据 ---

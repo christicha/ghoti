@@ -11,6 +11,7 @@ def collectcov(bugid, revision, resultPath, configPath):
     workpath = passdir + '/' + bugid
     os.chdir(workpath)
     covdir = compilerBasePath + revision + '/' + revision + '-build'
+
     if os.path.exists('gcdalist'):
         os.system('rm gcdalist')
     os.system('find ' + covdir + ' -name \"*.gcda\" > gcdalist')
